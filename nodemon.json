@@ -1,0 +1,6 @@
+{
+  "watch": ["src"],
+  "ext": "ts,json",
+  "delay": "1500",
+  "signal": "SIGTERM"
+}
