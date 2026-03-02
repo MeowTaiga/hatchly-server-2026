@@ -160,6 +160,27 @@ export class SceneInstance {
     return true;
   }
 
+  updateEquipped(
+    userId: string,
+    slot: 'handTool' | 'bobber' | 'chair',
+    value: string | null,
+  ): boolean {
+    const p = this.players.get(userId);
+    if (!p) return false;
+    if (slot === 'handTool') {
+      if (value) p.equippedHandTool = value;
+      else delete p.equippedHandTool;
+    } else if (slot === 'bobber') {
+      if (value) p.equippedBobber = value;
+      else delete p.equippedBobber;
+    } else {
+      if (value) p.equippedChair = value;
+      else delete p.equippedChair;
+    }
+    p.lastActivity = Date.now();
+    return true;
+  }
+
   updateUnwalkableTiles(tiles: Array<{ col: number; row: number }>): void {
     this._unwalkableSet = new Set(tiles.map((t) => `${t.col},${t.row}`));
   }

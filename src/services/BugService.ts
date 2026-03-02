@@ -228,8 +228,11 @@ export const bugService = {
       hostPlacedItemId = picked.hostPlacedItemId;
     } else {
       const { gridCols, gridRows } = await farmService.getGridDimensions(userId);
-      col = Math.floor(Math.random() * (gridCols - 2)) + 1;
-      row = Math.floor(Math.random() * (gridRows - 4)) + 2;
+      // Avoid edges; clamp for dynamic/small grids (gridCols/rows from scene or level)
+      const colRange = Math.max(1, gridCols - 2);
+      const rowRange = Math.max(1, gridRows - 4);
+      col = Math.min(gridCols - 1, Math.floor(Math.random() * colRange) + 1);
+      row = Math.min(gridRows - 1, Math.floor(Math.random() * rowRange) + 2);
     }
 
     const bug: ActiveBug = {

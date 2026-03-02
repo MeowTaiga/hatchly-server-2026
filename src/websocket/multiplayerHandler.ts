@@ -49,11 +49,22 @@ export function registerMultiplayerHandlers(socket: AuthenticatedSocket): void {
 
       socket.join(result.roomName);
 
+      // Include fishing state for players already in the instance so joiner sees existing bobbers
+      const fishingState = fishService.getFishingStateForScene(sceneSlug);
+      const instanceUserIds = new Set(result.players.map((p) => p.userId));
+      const fishingByUser: Record<string, { col: number; row: number; isReeling: boolean }> = {};
+      for (const [uid, state] of fishingState) {
+        if (instanceUserIds.has(uid)) {
+          fishingByUser[uid] = state;
+        }
+      }
+
       socket.emit(WS_EVENTS.MP_JOINED, {
         instanceId: result.instanceId,
         players: result.players,
         spawnX: result.self.x,
         spawnY: result.self.y,
+        ...(Object.keys(fishingByUser).length > 0 && { fishingByUser }),
       });
 
       socket.to(result.roomName).emit(WS_EVENTS.MP_PLAYER_JOINED, {

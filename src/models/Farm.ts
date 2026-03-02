@@ -13,6 +13,12 @@ export interface IPlacedItem {
   growthMs?: number;
   /** Whether this seed/crop has been watered. Growth only starts after watering. */
   watered?: boolean;
+  /** For trees: YYYY-MM-DD when planted or last growth stage advanced. Used for daily growth. */
+  treePlantedDate?: string;
+  /** For fully grown fruit trees: 0–3 fruit currently on tree. Reset to 0 after harvest. */
+  treeFruitCount?: number;
+  /** For fruit trees: YYYY-MM-DD when fruit was last harvested. Fruit regrows after 3 days. */
+  fruitLastHarvestedDate?: string;
 }
 
 export interface IEquipped {
@@ -56,6 +62,9 @@ const placedItemSchema = new Schema<IPlacedItem>(
     plantedAt: { type: Date },
     growthMs: { type: Number },
     watered: { type: Boolean },
+    treePlantedDate: { type: String },
+    treeFruitCount: { type: Number },
+    fruitLastHarvestedDate: { type: String },
   },
   { _id: false },
 );

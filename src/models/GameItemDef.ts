@@ -31,12 +31,12 @@ export interface IDirectionalImages {
 export type ItemCategory =
   | 'seed' | 'decoration' | 'ingredient' | 'building' | 'scenery'
   | 'flooring' | 'tiled_flooring' | 'fish' | 'bug' | 'equip' | 'soil' | 'food' | 'material' | 'asset'
-  | 'npc';
+  | 'npc' | 'tree';
 
 export const ITEM_CATEGORIES: ItemCategory[] = [
   'seed', 'decoration', 'ingredient', 'building', 'scenery',
   'flooring', 'tiled_flooring', 'fish', 'bug', 'equip', 'soil', 'food', 'material', 'asset',
-  'npc',
+  'npc', 'tree',
 ];
 
 export type BugRarity = 'common' | 'rare' | 'epic' | 'unique' | 'legendary' | 'mythic';
@@ -130,6 +130,10 @@ export interface IGameItemDef extends Document {
   foodBuffDurationMs?: number;
   /** Dialog steps shown when user taps NPC (subCategory 'npc'). Uses item label + imageUrl as speaker. */
   npcDialog?: IDialogStep[];
+  /** For fully grown trees: itemType of fruit this tree produces (e.g. 'apple'). Items with subCategory 'fruit'. */
+  treeFruit?: string;
+  /** For fruit items (subCategory 'fruit'): tree variant slugs this fruit can grow on (e.g. ['oak', 'dark_oak']). */
+  growsOnTrees?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -228,6 +232,8 @@ const gameItemDefSchema = new Schema<IGameItemDef>({
   foodBuffType: { type: String, default: undefined },
   foodBuffDurationMs: { type: Number, default: undefined, min: 0 },
   npcDialog: { type: [npcDialogStepSchema], default: undefined },
+  treeFruit: { type: String, default: undefined },
+  growsOnTrees: { type: [String], default: undefined },
 });
 
 gameItemDefSchema.plugin(basePlugin);

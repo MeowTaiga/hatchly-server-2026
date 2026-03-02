@@ -29,6 +29,8 @@ export const WS_EVENTS = {
   GAME_PLACE_ITEM: 'game:place_item',
   GAME_REMOVE_ITEM: 'game:remove_item',
   GAME_HARVEST: 'game:harvest',
+  /** Client → server: shake a tree to harvest fruit or other drops. */
+  GAME_SHAKE_TREE: 'game:shake_tree',
   GAME_RENAME_FARM: 'game:rename_farm',
   GAME_MOVE_ITEM: 'game:move_item',
   GAME_WATER_TILE: 'game:water_tile',
@@ -143,6 +145,8 @@ export const WS_EVENTS = {
   MP_POSE: 'mp:pose',
   /** Server → room: a player changed their pose. */
   MP_PLAYER_POSE: 'mp:player_pose',
+  /** Server → room: player changed equipped items (handTool, bobber, chair). */
+  MP_PLAYER_EQUIPPED: 'mp:player_equipped',
 
   // ─── Fishing Events ─────────────────────────────────────────────────────
   /** Client → server: cast fishing line at (col, row). */

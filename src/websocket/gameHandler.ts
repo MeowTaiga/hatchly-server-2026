@@ -15,7 +15,10 @@ import { petBehaviorStore } from '../services/PetBehaviorStore.js';
 import * as petAIService from '../services/PetAIService.js';
 import type { PetStateUpdatePayload } from '../services/PetAIService.js';
 import { digFossil } from '../services/FossilService.js';
+import { shakeTree } from '../services/TreeService.js';
 import { findAdjacentWalkableForItem } from '../services/PetTargeting.js';
+import { multiplayerManager } from '../services/MultiplayerManager.js';
+import { getIO } from './index.js';
 
 const log = createLogger('GameWS');
 
@@ -192,6 +195,19 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     }
   });
 
+  socket.on(WS_EVENTS.GAME_SHAKE_TREE, async (data: { anchorId: string }) => {
+    try {
+      if (!data?.anchorId) throw new Error('Missing anchorId');
+      const result = await shakeTree(userId, data.anchorId);
+      if (result) {
+        emitStateUpdate(result.stateUpdate);
+      }
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to shake tree' });
+      log.warn({ userId, data, err: err.message }, 'game:shake_tree failed');
+    }
+  });
+
   // ── Rename farm ─────────────────────────────────────────────────────────
 
   socket.on(WS_EVENTS.GAME_RENAME_FARM, async (data: { name: string }) => {
@@ -328,6 +344,18 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
           emitStateUpdate({ ...update, quests: questsAfterEquip });
         } else {
           emitStateUpdate(update);
+        }
+        // Broadcast equipment change to multiplayer room so other players see it (bait not shown on avatar)
+        const instance = multiplayerManager.getInstanceForUser(userId);
+        const mpSlot = data.slot === 'handTool' || data.slot === 'bobber' || data.slot === 'chair' ? data.slot : null;
+        if (instance && mpSlot) {
+          multiplayerManager.updatePlayerEquipped(userId, mpSlot, data.itemType ?? null);
+          const slotToKey = { handTool: 'equippedHandTool', bobber: 'equippedBobber', chair: 'equippedChair' } as const;
+          const key = slotToKey[mpSlot];
+          getIO().to(instance.roomName).emit(WS_EVENTS.MP_PLAYER_EQUIPPED, {
+            userId,
+            [key]: data.itemType ?? null,
+          });
         }
       } catch (err: any) {
         socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to equip' });

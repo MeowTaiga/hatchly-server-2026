@@ -27,10 +27,13 @@ import { UserQuest } from '../models/UserQuest.js';
 import { Farm } from '../models/Farm.js';
 import { Recipe } from '../models/Recipe.js';
 import { farmService, FARM_LEVELS } from '../services/FarmService.js';
+import { ensureCompoundTreeDefs } from '../services/TreeService.js';
 import { getIO } from '../websocket/index.js';
 import { WS_EVENTS } from '../websocket/events.js';
 import { multiplayerManager } from '../services/MultiplayerManager.js';
 import { mailService } from '../services/MailService.js';
+import { spawnStressTestBots, removeStressTestBots } from '../services/StressTestBotManager.js';
+import getImageColors from 'get-image-colors';
 
 
 const log = createLogger('AdminRoute');
@@ -222,6 +225,8 @@ const gameItemBodySchema = z.object({
       target: z.string().min(1),
     }).optional(),
   })).optional(),
+  treeFruit: z.string().min(1).max(48).optional(),
+  growsOnTrees: z.array(z.string().min(1).max(32)).optional(),
 });
 
 const gameItemUpdateSchema = z.object({
@@ -276,6 +281,8 @@ const gameItemUpdateSchema = z.object({
       target: z.string().min(1),
     }).optional(),
   })).optional().nullable(),
+  treeFruit: z.string().min(1).max(48).optional().nullable(),
+  growsOnTrees: z.array(z.string().min(1).max(32)).optional().nullable(),
 });
 
 const imageGenSchema = z.object({
@@ -306,6 +313,10 @@ router.post(
 
     const item = await GameItemDef.create(req.body);
     log.info({ admin: req.user?.id, itemType: item.itemType }, 'Game item created');
+
+    if (item.subCategory === 'fruit' && req.body.growsOnTrees?.length) {
+      await ensureCompoundTreeDefs(item.itemType, req.body.growsOnTrees);
+    }
 
     await broadcastItemDefs();
     success(res, item.toObject(), 201);
@@ -347,6 +358,8 @@ router.patch(
     if (updateData.lightColor === null) updateData.lightColor = undefined;
     if (updateData.lightIntensity === null) updateData.lightIntensity = undefined;
     if (updateData.npcDialog === null) updateData.npcDialog = undefined;
+    if (updateData.treeFruit === null) updateData.treeFruit = undefined;
+    if (updateData.growsOnTrees === null) updateData.growsOnTrees = undefined;
     if (updateData.availableUntil && typeof updateData.availableUntil === 'string') {
       updateData.availableUntil = new Date(updateData.availableUntil);
     }
@@ -357,6 +370,10 @@ router.patch(
       { new: true, runValidators: true },
     );
     if (!item) throw new AppError(`Item type "${itemType}" not found`, 404, 'ITEM_NOT_FOUND');
+
+    if (item.subCategory === 'fruit' && item.growsOnTrees?.length) {
+      await ensureCompoundTreeDefs(item.itemType, item.growsOnTrees);
+    }
 
     log.info({ admin: req.user?.id, itemType }, 'Game item updated');
 
@@ -379,6 +396,36 @@ router.delete(
 
     await broadcastItemDefs();
     success(res, { deleted: true, itemType });
+  }),
+);
+
+// ─── GET /admin/extract-image-colors — Extract dominant colors from an item's image ─
+
+const extractColorsQuerySchema = z.object({
+  itemType: z.string().min(1),
+});
+
+router.get(
+  '/extract-image-colors',
+  ...adminGuard,
+  validate({ query: extractColorsQuerySchema }),
+  catchAsync(async (req, res) => {
+    const { itemType } = req.query as { itemType: string };
+    const item = await GameItemDef.findOne({ itemType }).lean();
+    if (!item?.imageUrl) {
+      throw new AppError(`Item "${itemType}" has no image`, 400, 'NO_IMAGE');
+    }
+    const imageRes = await fetch(item.imageUrl);
+    if (!imageRes.ok) {
+      throw new AppError('Failed to fetch image', 502, 'FETCH_IMAGE_FAILED');
+    }
+    const arrayBuffer = await imageRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const contentType = imageRes.headers.get('content-type') || 'image/png';
+    const colors = await getImageColors(buffer, contentType);
+    const hexColors = colors.map((c: { hex: () => string }) => c.hex());
+    log.info({ admin: req.user?.id, itemType, count: hexColors.length }, 'Extracted image colors');
+    success(res, { colors: hexColors });
   }),
 );
 
@@ -915,6 +962,7 @@ const scenePlacementSchema = z.object({
   y: z.number(),
   scale: z.number().min(0.1).max(5).default(1),
   depthOffset: z.number().optional(),
+  rotationDegrees: z.number().min(0).max(360).optional(),
 });
 
 const walkableRectSchema = z.object({
@@ -1323,6 +1371,36 @@ router.patch(
   }),
 );
 
+/** POST /admin/my-farm/grant-item - Add item to current user's inventory (admin testing). */
+const grantItemSchema = z.object({
+  itemType: z.string().min(1).max(64),
+  qty: z.number().int().min(1).max(99).optional(),
+});
+router.post(
+  '/my-farm/grant-item',
+  ...adminGuard,
+  validate({ body: grantItemSchema }),
+  catchAsync(async (req, res) => {
+    const userId = (req as any).user?.id;
+    if (!userId) throw new AppError('Unauthorized', 401, 'UNAUTHORIZED');
+    const { itemType, qty = 1 } = (req as any).body;
+
+    const def = await GameItemDef.findOne({ itemType }).lean();
+    if (!def) throw new AppError(`Unknown item type: ${itemType}`, 400, 'UNKNOWN_ITEM');
+
+    const farm = await farmService.loadOrCreateFarm(userId);
+    const current = farm.inventory.get(itemType) ?? 0;
+    farm.inventory.set(itemType, current + qty);
+    farm.markModified('inventory');
+    await farm.save();
+
+    const inv: Record<string, number> = {};
+    for (const [k, v] of farm.inventory) if (v > 0) inv[k] = v;
+    log.info({ admin: userId, itemType, qty }, 'Admin granted item to own inventory');
+    success(res, { inventory: inv });
+  }),
+);
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Recipe Admin CRUD
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1443,6 +1521,41 @@ router.post(
     } catch (err) {
       throw new AppError(err instanceof Error ? err.message : 'Failed to send mail', 400, 'MAIL_SEND_FAILED');
     }
+  }),
+);
+
+// ─── Admin: Multiplayer Stress Test ───────────────────────────────────────
+
+const stressTestSchema = {
+  body: z.object({
+    count: z.number().int().min(1).max(30).default(10),
+  }),
+};
+
+router.post(
+  '/multiplayer/stress-test',
+  ...adminGuard,
+  validate(stressTestSchema),
+  catchAsync(async (req, res) => {
+    const adminId = req.user?._id?.toString();
+    if (!adminId) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
+    const count = (req.body as { count?: number }).count ?? 10;
+    const result = await spawnStressTestBots(adminId, count);
+    if (result.error) {
+      throw new AppError(result.error, 400, 'STRESS_TEST_FAILED');
+    }
+    success(res, { spawned: result.spawned });
+  }),
+);
+
+router.post(
+  '/multiplayer/stress-test/remove',
+  ...adminGuard,
+  catchAsync(async (req, res) => {
+    const adminId = req.user?._id?.toString();
+    if (!adminId) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
+    const result = removeStressTestBots(adminId);
+    success(res, { removed: result.removed });
   }),
 );
 

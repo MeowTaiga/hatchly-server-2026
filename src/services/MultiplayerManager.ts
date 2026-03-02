@@ -127,6 +127,12 @@ class MultiplayerManager {
     return { roomName: instance.roomName, clampedX: player!.x, clampedY: player!.y };
   }
 
+  updatePlayerEquipped(userId: string, slot: 'handTool' | 'bobber' | 'chair', value: string | null): boolean {
+    const instance = this.userInstance.get(userId);
+    if (!instance) return false;
+    return instance.updateEquipped(userId, slot, value);
+  }
+
   getInstanceForUser(userId: string): SceneInstance | undefined {
     return this.userInstance.get(userId);
   }

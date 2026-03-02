@@ -1,5 +1,6 @@
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import { GameItemDef } from '../models/GameItemDef.js';
+import { ensureCompoundTreeDefs } from '../services/TreeService.js';
 
 const ITEMS = [
   // ── Buildings ────────────────────────────────────────────────────────
@@ -171,6 +172,181 @@ const ITEMS = [
     cols: 1,
     rows: 1,
     sortOrder: 11,
+  },
+
+  // ── Fruit (subCategory for tree fruit) ───────────────────────────────
+  {
+    itemType: 'apple',
+    label: 'Apple',
+    emoji: '🍎',
+    color: '#E53935',
+    category: 'ingredient',
+    subCategory: 'fruit',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    growsOnTrees: ['oak'],
+    sortOrder: 11.5,
+  },
+  {
+    itemType: 'dark_oak_nut',
+    label: 'Dark Oak Nut',
+    emoji: '🌰',
+    color: '#5D4037',
+    category: 'ingredient',
+    subCategory: 'fruit',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    growsOnTrees: ['dark_oak'],
+    sortOrder: 11.6,
+  },
+
+  // ── Trees (oak: apple, dark_oak: dark_oak_nut) ───────────────────────
+  {
+    itemType: 'tree_sappling_oak',
+    label: 'Oak Sapling',
+    emoji: '🌱',
+    color: '#8BC34A',
+    category: 'tree',
+    placeable: true,
+    cols: 1,
+    rows: 1,
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 25,
+  },
+  {
+    itemType: 'tree_in_growth_oak',
+    label: 'Oak Tree (Growing)',
+    emoji: '🌳',
+    color: '#558B2F',
+    category: 'tree',
+    placeable: true,
+    cols: 2,
+    rows: 2,
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 26,
+  },
+  {
+    itemType: 'tree_fully_grown_oak',
+    label: 'Oak Tree',
+    emoji: '🌳',
+    color: '#2E7D32',
+    category: 'tree',
+    placeable: true,
+    cols: 4,
+    rows: 4,
+    treeFruit: 'apple',
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 27,
+  },
+  {
+    itemType: 'tree_sappling_dark_oak',
+    label: 'Dark Oak Sapling',
+    emoji: '🌱',
+    color: '#6D4C41',
+    category: 'tree',
+    placeable: true,
+    cols: 1,
+    rows: 1,
+    harvestYield: [{ itemType: 'dark_oak_wood', qty: 1 }],
+    sortOrder: 28,
+  },
+  {
+    itemType: 'tree_in_growth_dark_oak',
+    label: 'Dark Oak Tree (Growing)',
+    emoji: '🌲',
+    color: '#4E342E',
+    category: 'tree',
+    placeable: true,
+    cols: 2,
+    rows: 2,
+    harvestYield: [{ itemType: 'dark_oak_wood', qty: 1 }],
+    sortOrder: 29,
+  },
+  {
+    itemType: 'tree_fully_grown_dark_oak',
+    label: 'Dark Oak Tree',
+    emoji: '🌲',
+    color: '#3E2723',
+    category: 'tree',
+    placeable: true,
+    cols: 4,
+    rows: 4,
+    treeFruit: 'dark_oak_nut',
+    harvestYield: [{ itemType: 'dark_oak_wood', qty: 1 }],
+    sortOrder: 30,
+  },
+  // Plain oak (no fruit, wood only) — for starter "normal" trees
+  {
+    itemType: 'tree_sappling_oak_plain',
+    label: 'Oak Sapling',
+    emoji: '🌱',
+    color: '#8BC34A',
+    category: 'tree',
+    placeable: true,
+    cols: 1,
+    rows: 1,
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 30.5,
+  },
+  {
+    itemType: 'tree_in_growth_oak_plain',
+    label: 'Oak Tree (Growing)',
+    emoji: '🌳',
+    color: '#558B2F',
+    category: 'tree',
+    placeable: true,
+    cols: 2,
+    rows: 2,
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 30.6,
+  },
+  {
+    itemType: 'tree_fully_grown_oak_plain',
+    label: 'Oak Tree',
+    emoji: '🌳',
+    color: '#2E7D32',
+    category: 'tree',
+    placeable: true,
+    cols: 4,
+    rows: 4,
+    harvestYield: [{ itemType: 'oak_wood', qty: 1 }],
+    sortOrder: 30.7,
+  },
+  // Variant woods (from fully grown trees)
+  {
+    itemType: 'oak_wood',
+    label: 'Oak Wood',
+    emoji: '🪵',
+    color: '#8D6E63',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    sortOrder: 12.2,
+  },
+  {
+    itemType: 'dark_oak_wood',
+    label: 'Dark Oak Wood',
+    emoji: '🪵',
+    color: '#5D4E37',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    sortOrder: 12.3,
+  },
+  {
+    itemType: 'stick',
+    label: 'Stick',
+    emoji: '🪵',
+    color: '#A1887F',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    sortOrder: 12.5,
   },
 
   // ── Decorations ──────────────────────────────────────────────────────
@@ -452,6 +628,14 @@ async function seed() {
       { upsert: true, new: true },
     );
     console.log(`  Upserted: ${item.itemType}`);
+  }
+
+  for (const item of ITEMS) {
+    const fruit = item as { itemType: string; growsOnTrees?: string[] };
+    if (fruit.growsOnTrees?.length) {
+      await ensureCompoundTreeDefs(fruit.itemType, fruit.growsOnTrees);
+      console.log(`  Compound tree defs ensured for: ${fruit.itemType}`);
+    }
   }
 
   console.log(`\nSeeded ${ITEMS.length} game item definitions.`);

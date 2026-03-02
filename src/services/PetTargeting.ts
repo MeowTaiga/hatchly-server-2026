@@ -28,8 +28,10 @@ export function getBlockedTileKeysForPet(
       (def?.subCategory && walkableSubCategories.includes(def.subCategory)) ||
       (def?.interactAction?.payload && WALKABLE_INTERACT_PAYLOADS.includes(def.interactAction.payload as (typeof WALKABLE_INTERACT_PAYLOADS)[number]));
     if (isWalkable) continue;
-    const tileCols = item.tileCols ?? 1;
-    const tileRows = item.tileRows ?? 1;
+    // Child tiles (anchorId set) represent a single cell; only anchors use full tileCols/tileRows
+    const isChild = !!item.anchorId;
+    const tileCols = isChild ? 1 : (item.tileCols ?? 1);
+    const tileRows = isChild ? 1 : (item.tileRows ?? 1);
     for (let dr = 0; dr < tileRows; dr++) {
       for (let dc = 0; dc < tileCols; dc++) {
         blocked.add(tileKey(item.col + dc, item.row + dr));
@@ -259,8 +261,19 @@ export function findAdjacentWalkableForItem(
   cols: number,
   rows: number,
 ): TileCoord | null {
-  const blocked = getBlockedTileKeysForPet(placedItems, itemDefs, PET_WALKABLE_SUBCATEGORIES);
-  return getInteractionDestination(item, itemDefs, [], blocked, cols, rows);
+  const itemIds = new Set<string>([item.id, ...(item.anchorId ? [item.anchorId] : [])]);
+  const others = placedItems.filter((i) => !itemIds.has(i.id) && !itemIds.has(i.anchorId ?? ''));
+  const blocked = getBlockedTileKeysForPet(others, itemDefs, PET_WALKABLE_SUBCATEGORIES);
+  const dest = getInteractionDestination(item, itemDefs, [], blocked, cols, rows);
+  if (dest) return dest;
+  const { col: cc, row: cr } = getItemCenter(item);
+  if (
+    cc >= 0 && cc < cols && cr >= 0 && cr < rows &&
+    !blocked.has(tileKey(cc, cr))
+  ) {
+    return { col: cc, row: cr };
+  }
+  return null;
 }
 
 /** Pick an adjacent walkable tile to a bug. Pet will walk there and admire (wow). */

@@ -18,6 +18,17 @@ export function getYesterdayDateStr(timezone?: string): string {
 }
 
 /**
+ * Returns the date N days ago as YYYY-MM-DD in the given timezone.
+ * Used when placing fully grown trees so they don't regress on the next day.
+ */
+export function getDaysAgoDateStr(daysAgo: number, timezone?: string): string {
+  const today = getTodayDateStr(timezone);
+  const [y, m, d] = today.split('-').map(Number);
+  const past = new Date(Date.UTC(y, m - 1, d - daysAgo));
+  return past.toISOString().slice(0, 10);
+}
+
+/**
  * Returns today's date as YYYY-MM-DD in the given timezone.
  */
 export function getTodayDateStr(timezone?: string): string {

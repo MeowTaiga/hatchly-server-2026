@@ -3,6 +3,7 @@ import { GameItemDef } from '../models/GameItemDef.js';
 import { DailyLoginReward } from '../models/DailyLoginReward.js';
 import { User } from '../models/User.js';
 import { farmService } from './FarmService.js';
+import { advanceTreeGrowth } from './TreeService.js';
 import { getTodayDateStr, getYesterdaySummary } from '../utils/getYesterdaySummary.js';
 import { getDailyGreeting } from './PetGreetingService.js';
 import { appendPetMessage } from './PetChatService.js';
@@ -15,12 +16,18 @@ const FOSSIL_HOLE_COUNT = 2;
 /**
  * Finds empty grid slots for fossil placement. Prefers interior tiles (excludes edges);
  * falls back to any empty tile if no interior slots exist. Returns up to `count`
- * slots chosen randomly.
+ * slots chosen randomly. Marks ALL tiles occupied by multi-tile items (not just anchor).
  */
 function findEmptyGridSlots(placedItems: IPlacedItem[], gridCols: number, gridRows: number, count: number): { col: number; row: number }[] {
   const occupied = new Set<string>();
   for (const item of placedItems) {
-    occupied.add(`${item.col}:${item.row}`);
+    const cols = item.tileCols ?? 1;
+    const rows = item.tileRows ?? 1;
+    for (let dr = 0; dr < rows; dr++) {
+      for (let dc = 0; dc < cols; dc++) {
+        occupied.add(`${item.col + dc}:${item.row + dr}`);
+      }
+    }
   }
 
   const isEdge = (col: number, row: number) =>
@@ -104,6 +111,8 @@ export async function checkAndGrant(userId: string, timezone?: string): Promise<
     date: today,
     rewardedAt: new Date(),
   });
+
+  await advanceTreeGrowth(userId, timezone);
 
   log.info({ userId }, 'Daily login rewards granted');
   return { greeting };

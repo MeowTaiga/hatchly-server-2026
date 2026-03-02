@@ -694,7 +694,7 @@ export const questService = {
    * Supports both generic actions ("harvest") and item-specific ("harvest:wheat_seed").
    * Returns updated quest progress if any changed.
    */
-  async trackAction(userId: string, action: string, itemType?: string): Promise<QuestProgressPayload[] | null> {
+  async trackAction(userId: string, action: string, itemType?: string, count = 1): Promise<QuestProgressPayload[] | null> {
     const activeQuests = await UserQuest.find({ userId, status: 'active' });
     if (activeQuests.length === 0) return null;
 
@@ -716,10 +716,10 @@ export const questService = {
 
         const key = reqAction.itemType ? `${action}:${reqAction.itemType}` : action;
         const current = uq.progress.actions.get(key) ?? 0;
-        uq.progress.actions.set(key, current + 1);
+        uq.progress.actions.set(key, current + count);
         uq.markModified('progress.actions');
         questChanged = true;
-        log.info({ questId: uq.questId, action, itemType, key, count: current + 1 }, 'Quest action tracked');
+        log.info({ questId: uq.questId, action, itemType, key, count: current + count }, 'Quest action tracked');
       }
 
       if (questChanged) {
@@ -767,7 +767,7 @@ export const questService = {
     return this.getQuestsForUser(userId);
   },
 
-  async trackCropGrown(userId: string, itemType: string): Promise<QuestProgressPayload[] | null> {
+  async trackCropGrown(userId: string, itemType: string, count = 1): Promise<QuestProgressPayload[] | null> {
     const activeQuests = await UserQuest.find({ userId, status: 'active' });
     if (activeQuests.length === 0) return null;
 
@@ -788,11 +788,11 @@ export const questService = {
       if (!uq.progress.cropsGrown) uq.progress.cropsGrown = new Map();
       const key = itemType;
       const current = uq.progress.cropsGrown.get(key) ?? 0;
-      uq.progress.cropsGrown.set(key, current + 1);
+      uq.progress.cropsGrown.set(key, current + count);
       uq.markModified('progress.cropsGrown');
       await uq.save();
       anyChanged = true;
-      log.info({ questId: uq.questId, itemType, count: current + 1 }, 'Quest crop grown tracked');
+      log.info({ questId: uq.questId, itemType, count: current + count }, 'Quest crop grown tracked');
     }
 
     if (!anyChanged) return null;

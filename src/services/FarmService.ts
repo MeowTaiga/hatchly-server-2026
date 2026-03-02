@@ -1,5 +1,6 @@
 import { Farm, type IFarm, type IPlacedItem } from '../models/Farm.js';
 import { GameItemDef, type IGameItemDef } from '../models/GameItemDef.js';
+import { getTodayDateStr, getDaysAgoDateStr } from '../utils/getYesterdaySummary.js';
 import { Scene } from '../models/Scene.js';
 import { SLOT_TO_SUB_CATEGORIES } from '../constants/equipSlots.js';
 import { BakedScenery } from '../models/BakedScenery.js';
@@ -8,6 +9,7 @@ import { createLogger } from '../config/logger.js';
 import { questService, type QuestProgressPayload } from './QuestService.js';
 import { petService, type PublicPet } from './PetService.js';
 import { petBehaviorStore, PET_DEFAULT_COL, PET_DEFAULT_ROW } from './PetBehaviorStore.js';
+import { createTreeTiles } from './TreeService.js';
 import crypto from 'crypto';
 
 const log = createLogger('FarmService');
@@ -36,7 +38,7 @@ export const FARM_LEVELS = [
   { level: 8, xpRequired: 2200, title: 'Legendary', emoji: '👑', cols: 32, rows: 40 },
 ] as const;
 
-/** Default grid size for new farms (level 1). Single source of truth from FARM_LEVELS. */
+/** Fallback for inBounds when dimensions not provided. Prefer resolveGridDimensions for actual farm size. */
 const DEFAULT_GRID_COLS = FARM_LEVELS[0].cols;
 const DEFAULT_GRID_ROWS = FARM_LEVELS[0].rows;
 
@@ -110,6 +112,9 @@ export interface PlacedItemSnapshot {
   plantedAt?: number;
   growthMs?: number;
   watered?: boolean;
+  treePlantedDate?: string;
+  treeFruitCount?: number;
+  fruitLastHarvestedDate?: string;
 }
 
 export interface EquippedSnapshot {
@@ -167,6 +172,16 @@ export interface StateUpdate {
   autoCompletedQuests?: AutoCompletedQuest[];
   /** When present, client should apply pet update (e.g. mood raised from farm action). */
   pet?: PublicPet;
+  /** Tree shake result — client shows jiggle+shrink harvest effect and bubble. */
+  shakeResult?: {
+    drops: Array<{ itemType: string; qty: number }>;
+    col: number;
+    row: number;
+    tileCols: number;
+    tileRows: number;
+    cropEmoji?: string;
+    cropImageUrl?: string;
+  };
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -187,6 +202,9 @@ function toPlacedSnapshot(item: IPlacedItem): PlacedItemSnapshot {
     plantedAt: item.plantedAt ? item.plantedAt.getTime() : undefined,
     growthMs: item.growthMs,
     watered: item.watered,
+    treePlantedDate: item.treePlantedDate,
+    treeFruitCount: item.treeFruitCount,
+    fruitLastHarvestedDate: item.fruitLastHarvestedDate,
   };
 }
 
@@ -274,6 +292,70 @@ function hasSoilOverlap(
   return false;
 }
 
+/**
+ * Finds empty 2x2 slots for tree placement. Returns up to `count` non-overlapping top-left positions.
+ * Saplings start 1x1 but grow to 2x2, so we reserve 2x2 at placement.
+ */
+function findEmptyTreeSlots(
+  placedItems: IPlacedItem[],
+  gridCols: number,
+  gridRows: number,
+  count: number,
+): { col: number; row: number }[] {
+  const TREE_SIZE = 2;
+  const occupied = new Set<string>();
+  for (const item of placedItems) {
+    for (let dr = 0; dr < (item.tileRows ?? 1); dr++) {
+      for (let dc = 0; dc < (item.tileCols ?? 1); dc++) {
+        occupied.add(`${item.col + dc}:${item.row + dr}`);
+      }
+    }
+  }
+
+  const candidates: { col: number; row: number }[] = [];
+  for (let row = 0; row + TREE_SIZE <= gridRows; row++) {
+    for (let col = 0; col + TREE_SIZE <= gridCols; col++) {
+      let valid = true;
+      for (let dr = 0; dr < TREE_SIZE && valid; dr++) {
+        for (let dc = 0; dc < TREE_SIZE; dc++) {
+          if (occupied.has(`${col + dc}:${row + dr}`)) {
+            valid = false;
+            break;
+          }
+        }
+      }
+      if (valid) candidates.push({ col, row });
+    }
+  }
+
+  for (let i = candidates.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+  }
+
+  const result: { col: number; row: number }[] = [];
+  const used = new Set<string>();
+  for (const slot of candidates) {
+    if (result.length >= count) break;
+    const key = `${slot.col}:${slot.row}`;
+    if (used.has(key)) continue;
+    let overlaps = false;
+    for (let dr = 0; dr < TREE_SIZE && !overlaps; dr++) {
+      for (let dc = 0; dc < TREE_SIZE; dc++) {
+        if (used.has(`${slot.col + dc}:${slot.row + dr}`)) overlaps = true;
+      }
+    }
+    if (overlaps) continue;
+    result.push(slot);
+    for (let dr = 0; dr < TREE_SIZE; dr++) {
+      for (let dc = 0; dc < TREE_SIZE; dc++) {
+        used.add(`${slot.col + dc}:${slot.row + dr}`);
+      }
+    }
+  }
+  return result;
+}
+
 /** Returns true if the footprint fits within grid bounds. */
 function inBounds(col: number, row: number, cols: number, rows: number, gridCols: number = DEFAULT_GRID_COLS, gridRows: number = DEFAULT_GRID_ROWS): boolean {
   for (let dr = 0; dr < rows; dr++) {
@@ -284,25 +366,33 @@ function inBounds(col: number, row: number, cols: number, rows: number, gridCols
   return true;
 }
 
-/** Creates placed item tiles for a given definition at a position. */
+/**
+ * Creates placed item tiles for a given definition at a position.
+ * @param placementCols - Override for tile footprint (e.g. tree sapling: 2x2 placement, 1x1 image).
+ * @param placementRows - Override for tile footprint.
+ */
 function createPlacedTiles(
   def: IGameItemDef,
   col: number,
   row: number,
+  placementCols?: number,
+  placementRows?: number,
 ): IPlacedItem[] {
   const anchorId = genId();
   const isCrop = !!def.growthMs;
+  const cols = placementCols ?? def.cols;
+  const rows = placementRows ?? def.rows;
   const items: IPlacedItem[] = [];
-  for (let dr = 0; dr < def.rows; dr++) {
-    for (let dc = 0; dc < def.cols; dc++) {
+  for (let dr = 0; dr < rows; dr++) {
+    for (let dc = 0; dc < cols; dc++) {
       const isAnchor = dr === 0 && dc === 0;
       items.push({
         id: isAnchor ? anchorId : genId(),
         itemType: def.itemType,
         col: col + dc,
         row: row + dr,
-        tileCols: def.cols,
-        tileRows: def.rows,
+        tileCols: cols,
+        tileRows: rows,
         anchorId: isAnchor ? undefined : anchorId,
         plantedAt: undefined,
         growthMs: isCrop ? def.growthMs : undefined,
@@ -322,6 +412,8 @@ export const farmService = {
   async loadOrCreateFarm(userId: string): Promise<IFarm> {
     let farm = await Farm.findOne({ userId });
     if (!farm) {
+      // Resolve dynamic grid dimensions (scene or level defaults) for new farm
+      const { gridCols, gridRows } = await resolveGridDimensions(userId, 0);
       const [houseDef, sellBoxDef, mailBoxDef] = await Promise.all([
         GameItemDef.findOne({ itemType: 'house' }).lean(),
         GameItemDef.findOne({ itemType: 'sell_box' }).lean(),
@@ -329,7 +421,7 @@ export const farmService = {
       ]);
       const starterPlaced: IPlacedItem[] = [];
       if (houseDef) {
-        const houseCol = Math.floor((DEFAULT_GRID_COLS - houseDef.cols) / 2);
+        const houseCol = Math.floor((gridCols - houseDef.cols) / 2);
         const houseRow = 0;
         starterPlaced.push(...createPlacedTiles(houseDef, houseCol, houseRow));
         if (sellBoxDef) {
@@ -347,6 +439,56 @@ export const farmService = {
           }
         }
       }
+      const today = getTodayDateStr();
+      const treePlantedDateFullyGrown = getDaysAgoDateStr(3); // So advanceTreeGrowth won't regress next day
+      // 5 slots: 3 fruit trees + 2 normal oak trees (all fully grown at start)
+      const treeSlots = findEmptyTreeSlots(starterPlaced, gridCols, gridRows, 5);
+      const fruitDefs = await GameItemDef.find({ subCategory: 'fruit' }).lean();
+      const fullyGrownFruitTrees = await GameItemDef.find({
+        category: 'tree',
+        itemType: /^tree_fully_grown_/,
+        treeFruit: { $exists: true, $ne: '' },
+      }).lean();
+      // Build fruit -> fully_grown type(s)
+      const fruitToFullyGrown = new Map<string, string[]>();
+      for (const fg of fullyGrownFruitTrees) {
+        if (fg.treeFruit) {
+          const itemType = fg.itemType;
+          const arr = fruitToFullyGrown.get(fg.treeFruit) ?? [];
+          if (!arr.includes(itemType)) arr.push(itemType);
+          fruitToFullyGrown.set(fg.treeFruit, arr);
+        }
+      }
+      const eligibleFruits = fruitDefs
+        .map((f) => f.itemType)
+        .filter((ft) => fruitToFullyGrown.has(ft));
+      // Pick 1 random fruit for the farm; all 3 fruit trees use this variant
+      const chosenFruit = eligibleFruits.length > 0
+        ? eligibleFruits[Math.floor(Math.random() * eligibleFruits.length)]
+        : null;
+      const fullyGrownOptions = chosenFruit ? fruitToFullyGrown.get(chosenFruit)! : [];
+      const fruitTreeType = fullyGrownOptions.length > 0
+        ? fullyGrownOptions[Math.floor(Math.random() * fullyGrownOptions.length)]
+        : null;
+
+      // Place 3 fully grown fruit trees (with 3 fruit each)
+      const fruitCount = Math.min(3, treeSlots.length);
+      if (fruitTreeType && fruitCount > 0) {
+        for (const slot of treeSlots.slice(0, fruitCount)) {
+          const tiles = createTreeTiles(fruitTreeType, slot.col, slot.row, treePlantedDateFullyGrown, 3);
+          starterPlaced.push(...tiles);
+        }
+      }
+      // Place 2 fully grown normal oak trees (no fruit, wood only)
+      const oakCount = Math.min(2, Math.max(0, treeSlots.length - 3));
+      const oakPlainType = 'tree_fully_grown_oak_plain';
+      const oakPlainExists = await GameItemDef.findOne({ itemType: oakPlainType }).lean();
+      if (oakPlainExists && oakCount > 0) {
+        for (const slot of treeSlots.slice(3, 3 + oakCount)) {
+          const tiles = createTreeTiles(oakPlainType, slot.col, slot.row, treePlantedDateFullyGrown);
+          starterPlaced.push(...tiles);
+        }
+      }
       farm = await Farm.create({
         userId,
         inventory: new Map(Object.entries(STARTER_INVENTORY)),
@@ -354,13 +496,36 @@ export const farmService = {
       });
       log.info({ userId }, 'Created new farm with house');
     } else {
+      // Backfill: fully grown fruit trees that have never been harvested should show 3 fruit
+      const itemDefsMap = await loadItemDefsMap();
+      let fruitBackfill = false;
+      for (const item of farm.placedItems) {
+        if (item.anchorId) continue;
+        const def = itemDefsMap[item.itemType];
+        if (
+          def?.category === 'tree' &&
+          item.itemType.startsWith('tree_fully_grown_') &&
+          def.treeFruit &&
+          !item.fruitLastHarvestedDate &&
+          (item.treeFruitCount ?? 0) < 3
+        ) {
+          (item as IPlacedItem & { treeFruitCount?: number }).treeFruitCount = 3;
+          fruitBackfill = true;
+        }
+      }
+      if (fruitBackfill) {
+        farm.markModified('placedItems');
+        await farm.save();
+      }
+
       // Backfill: give existing farms a house if they don't have one
       const hasHouse = farm.placedItems.some((i) => i.itemType === 'house');
       const hasHouseInv = (farm.inventory.get('house') ?? 0) > 0;
       if (!hasHouse && !hasHouseInv) {
         const houseDef = await GameItemDef.findOne({ itemType: 'house' }).lean();
         if (houseDef) {
-          const houseCol = Math.floor((DEFAULT_GRID_COLS - houseDef.cols) / 2);
+          const { gridCols } = await resolveGridDimensions(userId, farm.xp);
+          const houseCol = Math.floor((gridCols - houseDef.cols) / 2);
           const houseRow = 0;
           const houseTiles = createPlacedTiles(houseDef, houseCol, houseRow);
           const blocked = hasCollision(farm.placedItems, houseCol, houseRow, houseDef.cols, houseDef.rows);
@@ -398,18 +563,27 @@ export const farmService = {
       questService.getQuestsForUser(userId),
       questService.canUpgradeFarm(userId, level.level),
       questService.getPendingDialogs(userId),
-      Scene.findOne({ slug: sceneSlug }).select('cols rows bakedImageUrl').lean(),
+      Scene.findOne({ slug: sceneSlug }).select('cols rows bakedImageUrl placements').lean(),
     ]);
 
     let sceneryUrl = sceneryRecord?.imageUrl;
     let sceneWorldCols: number | undefined;
     let sceneWorldRows: number | undefined;
+    let scenePlacements: Array<{ id: string; itemType: string; x: number; y: number; scale: number; depthOffset?: number }> | undefined;
 
     if (scene?.bakedImageUrl) {
       sceneryUrl = scene.bakedImageUrl;
       sceneWorldCols = scene.cols;
       sceneWorldRows = scene.rows;
-      log.info({ userId, sceneSlug, sceneWorldCols, sceneWorldRows }, 'Snapshot: using scene baked scenery');
+      scenePlacements = scene.placements?.length ? scene.placements.map((p) => ({
+        id: p.id,
+        itemType: p.itemType,
+        x: p.x,
+        y: p.y,
+        scale: p.scale ?? 1,
+        depthOffset: p.depthOffset,
+      })) : undefined;
+      log.info({ userId, sceneSlug, sceneWorldCols, sceneWorldRows, placementCount: scenePlacements?.length ?? 0 }, 'Snapshot: using scene baked scenery');
     } else if (sceneryRecord?.imageUrl) {
       log.info({ userId, gridCols, gridRows, sceneryUrl: sceneryRecord.imageUrl }, 'Snapshot: using BAKED scenery');
     } else {
@@ -449,6 +623,7 @@ export const farmService = {
       sceneryUrl,
       sceneWorldCols,
       sceneWorldRows,
+      scenePlacements,
       quests,
       canUpgrade,
       pendingDialogs: pendingDialogs.length > 0 ? pendingDialogs : undefined,
@@ -543,8 +718,35 @@ export const farmService = {
       }
     }
 
+    const isTree = def.category === 'tree';
+    const treePlacementCols = isTree ? 2 : (def.cols ?? 1);
+    const treePlacementRows = isTree ? 2 : (def.rows ?? 1);
+    if (isTree) {
+      if (hasCollision(farm.placedItems, col, row, treePlacementCols, treePlacementRows)) {
+        throw new Error('Trees need a clear area');
+      }
+      if (!inBounds(col, row, treePlacementCols, treePlacementRows, gridCols, gridRows)) {
+        throw new Error('Tree placement out of bounds');
+      }
+    }
+
     const currentLvl = await resolveFarmLevel(userId, farm.xp);
-    const newItems = createPlacedTiles(def, col, row);
+    const newItems = isTree
+      ? createPlacedTiles(def, col, row, 2, 2)
+      : createPlacedTiles(def, col, row);
+    if (isTree) {
+      const today = getTodayDateStr();
+      const isFullyGrown = itemType.startsWith('tree_fully_grown_');
+      const isFullyGrownFruitTree = isFullyGrown && (def as IGameItemDef).treeFruit;
+      // Fully grown trees: use (today - 3) so advanceTreeGrowth won't regress them next day
+      const treePlantedDate = isFullyGrown ? getDaysAgoDateStr(3) : today;
+      for (const item of newItems) {
+        (item as IPlacedItem & { treePlantedDate?: string }).treePlantedDate = treePlantedDate;
+        if (isFullyGrownFruitTree && !item.anchorId) {
+          (item as IPlacedItem & { treeFruitCount?: number }).treeFruitCount = 3;
+        }
+      }
+    }
     farm.placedItems.push(...newItems);
     farm.inventory.set(itemType, qty - 1);
     awardXp(farm, FARM_XP_REWARDS.place);
@@ -747,6 +949,16 @@ export const farmService = {
       .map((i) => i.id);
     farm.placedItems = farm.placedItems.filter((i) => !oldIds.includes(i.id));
 
+    const isTree = def.category === 'tree';
+    const moveCols = isTree ? (anchorItem.tileCols ?? 2) : def.cols;
+    const moveRows = isTree ? (anchorItem.tileRows ?? 2) : def.rows;
+    if (!inBounds(newCol, newRow, moveCols, moveRows, gridCols, gridRows)) {
+      throw new Error('Move destination out of bounds');
+    }
+    if (hasCollision(farm.placedItems, newCol, newRow, moveCols, moveRows, anchId)) {
+      throw new Error(isTree ? 'Trees need a clear area' : 'Destination overlaps another item');
+    }
+
     if (def.category === 'soil') {
       const itemDefsMap = await loadItemDefsMap();
       if (hasSoilOverlap(farm.placedItems, itemDefsMap, newCol, newRow, def.cols, def.rows)) {
@@ -755,21 +967,29 @@ export const farmService = {
     }
 
     const newItems: IPlacedItem[] = [];
-    for (let dr = 0; dr < def.rows; dr++) {
-      for (let dc = 0; dc < def.cols; dc++) {
+    for (let dr = 0; dr < moveRows; dr++) {
+      for (let dc = 0; dc < moveCols; dc++) {
         const isAnchor = dr === 0 && dc === 0;
-        newItems.push({
+        const item: IPlacedItem = {
           id: isAnchor ? anchId : genId(),
           itemType: target.itemType,
           col: newCol + dc,
           row: newRow + dr,
-          tileCols: def.cols,
-          tileRows: def.rows,
+          tileCols: moveCols,
+          tileRows: moveRows,
           anchorId: isAnchor ? undefined : anchId,
           plantedAt: anchorItem.plantedAt,
           growthMs: anchorItem.growthMs,
           watered: anchorItem.watered,
-        });
+        };
+        if (isTree) {
+          item.treePlantedDate = anchorItem.treePlantedDate;
+          if (isAnchor) {
+            item.treeFruitCount = anchorItem.treeFruitCount;
+            item.fruitLastHarvestedDate = anchorItem.fruitLastHarvestedDate;
+          }
+        }
+        newItems.push(item);
       }
     }
 
@@ -1220,22 +1440,24 @@ export const farmService = {
 
     log.info({ userId, opCount: ops.length, failed: failedOps.length }, 'Crop batch processed');
 
-    // Track quest actions (parallelized)
-    const uniqueActions = new Map<string, Set<string>>();
-    const harvestCropTypes = new Set<string>();
+    // Track quest actions (parallelized) — count occurrences for batch harvest/plant
+    const actionCounts = new Map<string, Map<string, number>>();
     for (const ta of trackActions) {
-      if (!uniqueActions.has(ta.action)) uniqueActions.set(ta.action, new Set());
-      uniqueActions.get(ta.action)!.add(ta.itemType);
-      if (ta.action === 'harvest') harvestCropTypes.add(ta.itemType);
+      if (!actionCounts.has(ta.action)) actionCounts.set(ta.action, new Map());
+      const itemMap = actionCounts.get(ta.action)!;
+      itemMap.set(ta.itemType, (itemMap.get(ta.itemType) ?? 0) + 1);
     }
     const trackPromises: Promise<unknown>[] = [];
-    for (const [action, itemTypes] of uniqueActions) {
-      for (const itemType of itemTypes) {
-        trackPromises.push(questService.trackAction(userId, action, itemType));
+    for (const [action, itemMap] of actionCounts) {
+      for (const [itemType, count] of itemMap) {
+        trackPromises.push(questService.trackAction(userId, action, itemType, count));
       }
     }
-    for (const itemType of harvestCropTypes) {
-      trackPromises.push(questService.trackCropGrown(userId, itemType));
+    const harvestCounts = actionCounts.get('harvest');
+    if (harvestCounts) {
+      for (const [itemType, count] of harvestCounts) {
+        trackPromises.push(questService.trackCropGrown(userId, itemType, count));
+      }
     }
     await Promise.all(trackPromises);
 

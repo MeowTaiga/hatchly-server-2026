@@ -199,6 +199,25 @@ export const fishService = {
     return { caught: true, result };
   },
 
+  /**
+   * Get current fishing state for all users in a scene.
+   * Used when a player joins so they can see existing bobbers.
+   */
+  getFishingStateForScene(sceneSlug: string): Map<string, { col: number; row: number; isReeling: boolean }> {
+    const result = new Map<string, { col: number; row: number; isReeling: boolean }>();
+    for (const [uid, p] of pendingMap) {
+      if (p.sceneSlug === sceneSlug) {
+        result.set(uid, { col: p.col, row: p.row, isReeling: false });
+      }
+    }
+    for (const [uid, a] of awaitingResultMap) {
+      if (a.sceneSlug === sceneSlug) {
+        result.set(uid, { col: a.col, row: a.row, isReeling: true });
+      }
+    }
+    return result;
+  },
+
   /** Cancel a scheduled fishing attempt. Returns true if something was cancelled. */
   cancelFishing(userId: string): boolean {
     const pending = pendingMap.get(userId);
