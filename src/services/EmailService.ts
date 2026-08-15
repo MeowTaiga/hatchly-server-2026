@@ -2,6 +2,10 @@ import nodemailer, { type Transporter } from 'nodemailer';
 import { env } from '../config/env.js';
 import { createLogger } from '../config/logger.js';
 import { AppError } from '../middleware/errorHandler.js';
+import {
+  WAITLIST_WELCOME_SUBJECT,
+  waitlistWelcomeHtml,
+} from '../emailTemplates/waitlistWelcome.js';
 
 const log = createLogger('EmailService');
 
@@ -18,7 +22,7 @@ class EmailService {
       port: 465,
       secure: true,
       auth: {
-        user: 'hello@hatchly.app',
+        user: 'support@hatchly.me',
         pass: env.EMAIL_PASSWORD,
       },
     });
@@ -35,7 +39,7 @@ class EmailService {
   async send(to: string, subject: string, html: string): Promise<void> {
     try {
       await this.transporter.sendMail({
-        from: '"Hatchly" <hello@hatchly.app>',
+        from: '"Hatchly" <support@hatchly.me>',
         to,
         subject,
         html,
@@ -44,6 +48,15 @@ class EmailService {
     } catch (err: any) {
       log.error({ err, to, subject }, 'Failed to send email');
       throw new AppError('Email delivery failed', 502, 'EMAIL_SEND_FAILED');
+    }
+  }
+
+  /** Earlybird waitlist welcome — does not throw (signup should still succeed). */
+  async sendWaitlistWelcome(to: string): Promise<void> {
+    try {
+      await this.send(to, WAITLIST_WELCOME_SUBJECT, waitlistWelcomeHtml());
+    } catch (err) {
+      log.error({ err, to }, 'Waitlist welcome email failed');
     }
   }
 }

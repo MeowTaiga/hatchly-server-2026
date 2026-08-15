@@ -6,6 +6,7 @@ import { catchAsync } from '../utils/catchAsync.js';
 import { success } from '../utils/response.js';
 import { Waitlist } from '../models/Waitlist.js';
 import { discordService } from '../services/DiscordService.js';
+import { emailService } from '../services/EmailService.js';
 
 const router = Router();
 
@@ -72,6 +73,7 @@ router.post(
     });
 
     void discordService.trackWaitlist({ email, ip, source, alreadyJoined: false });
+    void emailService.sendWaitlistWelcome(email);
 
     success(
       res,
