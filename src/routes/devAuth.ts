@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { User } from '../models/User.js';
 import { UserEntity } from '../entities/UserEntity.js';
@@ -18,7 +18,7 @@ import { isDev } from '../config/env.js';
  */
 const router = Router();
 
-router.use((_req, _res, next) => {
+router.use((_req: Request, _res: Response, next: NextFunction) => {
   if (!isDev) return next(new AppError('Route not found', 404, 'NOT_FOUND'));
   next();
 });

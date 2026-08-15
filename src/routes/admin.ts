@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { protect, requireRole } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
@@ -53,7 +53,7 @@ const log = createLogger('AdminRoute');
 const router = Router();
 
 /** Log every request hitting /admin/* to diagnose routing. */
-router.use((req, _res, next) => {
+router.use((req: Request, _res: Response, next: NextFunction) => {
   log.info({ method: req.method, path: req.path, url: req.originalUrl }, 'Admin request');
   next();
 });

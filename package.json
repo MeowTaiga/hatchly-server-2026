@@ -45,6 +45,13 @@
     "@aws-sdk/client-s3": "^3.990.0",
     "@aws-sdk/s3-request-presigner": "^3.990.0",
     "@google/genai": "^1.41.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/hpp": "^0.2.7",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.2.3",
+    "@types/nodemailer": "^7.0.10",
+    "@types/sharp": "^0.31.1",
     "axios": "^1.13.5",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
@@ -63,19 +70,12 @@
     "sharp": "^0.34.5",
     "socket.io": "^4.8.3",
     "twilio": "^5.12.1",
+    "typescript": "^5.9.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/hpp": "^0.2.7",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/node": "^25.2.3",
-    "@types/nodemailer": "^7.0.10",
-    "@types/sharp": "^0.31.1",
     "nodemon": "^3.1.11",
     "socket.io-client": "^4.8.3",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "tsx": "^4.21.0"
   }
 }
