@@ -28,6 +28,7 @@ import mailRoutes from './routes/mail.js';
 import notificationsRoutes from './routes/notifications.js';
 import chatRoutes from './routes/chat.js';
 import waitlistRoutes from './routes/waitlist.js';
+import analyticsRoutes from './routes/analytics.js';
 import devAuthRoutes from './routes/devAuth.js';
 
 // ─── Crash traps — catch EVERYTHING so we see the real error ─────────────────
@@ -77,6 +78,9 @@ async function bootstrap(): Promise<void> {
 
   const app = express();
 
+  // Correct client IPs behind Vercel / nginx / Cloudflare
+  app.set('trust proxy', 1);
+
   applySecurity(app);
   app.use(apiLimiter);
 
@@ -106,6 +110,7 @@ async function bootstrap(): Promise<void> {
   app.use('/notifications', notificationsRoutes);
   app.use('/chat', chatRoutes);
   app.use('/waitlist', waitlistRoutes);
+  app.use('/analytics', analyticsRoutes);
 
   if (isDev) {
     app.use('/dev-auth', devAuthRoutes);

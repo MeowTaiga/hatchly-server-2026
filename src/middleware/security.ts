@@ -17,9 +17,12 @@ import { env, isDev } from '../config/env.js';
 export function applySecurity(app: Express): void {
   app.use(helmet());
 
-  const allowedOrigins = [env.CLIENT_URL, env.MARKETING_URL].filter(
-    (origin): origin is string => Boolean(origin),
-  );
+  const allowedOrigins = [
+    env.CLIENT_URL,
+    env.MARKETING_URL,
+    'https://hatchly.me',
+    'https://www.hatchly.me',
+  ].filter((origin): origin is string => Boolean(origin));
 
   app.use(
     cors({
