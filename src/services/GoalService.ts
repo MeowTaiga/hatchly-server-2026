@@ -210,7 +210,7 @@ function isDueToday(goal: { enabled: boolean; archived: boolean; repeat: GoalRep
 }
 
 function toPublic(goal: IUserGoal, weekday: number, completedIds: Set<string>): PublicGoal {
-  const id = goal.id || String(goal._id);
+  const id = String(goal._id);
   return {
     id,
     source: goal.source,

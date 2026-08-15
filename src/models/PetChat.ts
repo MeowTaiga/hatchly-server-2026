@@ -16,7 +16,7 @@ export interface IPetChatGoalCardGoal {
   iconItemType: string;
   iconImageUrl?: string;
   iconEmoji?: string;
-  repeat: 'daily' | 'weekdays';
+  repeat: 'daily' | 'weekdays' | 'once';
   repeatDays: number[];
   remindAt?: string;
   dueToday: boolean;
@@ -61,7 +61,7 @@ const goalCardGoalSchema = new Schema<IPetChatGoalCardGoal>(
     iconItemType: { type: String, required: true },
     iconImageUrl: { type: String },
     iconEmoji: { type: String },
-    repeat: { type: String, enum: ['daily', 'weekdays'], required: true },
+    repeat: { type: String, enum: ['daily', 'weekdays', 'once'], required: true },
     repeatDays: { type: [Number], default: [] },
     remindAt: { type: String },
     dueToday: { type: Boolean, required: true },

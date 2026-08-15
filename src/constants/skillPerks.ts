@@ -65,7 +65,7 @@ export const SKILL_PERKS: Record<SkillId, SkillPerk[]> = {
     { level: 15, title: 'Steady hands', description: 'Crafting minigame is a little easier', effect: { type: 'crafting_ease', amount: 1 } },
     { level: 30, title: 'Workshop flow', description: 'Crafting minigame is easier', effect: { type: 'crafting_ease', amount: 1 } },
     { level: 45, title: 'Master artisan', description: 'Crafting minigame is much easier', effect: { type: 'crafting_ease', amount: 1 } },
-  ].sort((a, b) => a.level - b.level || a.title.localeCompare(b.title)),
+  ].sort((a, b) => a.level - b.level || a.title.localeCompare(b.title)) as SkillPerk[],
 
   fishing: [
     { level: 5, title: 'Steady hands', description: 'Fishing minigame is a little easier', effect: { type: 'fishing_ease', amount: 1 } },

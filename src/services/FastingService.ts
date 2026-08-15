@@ -28,7 +28,7 @@ export interface FastingState {
 function toPublic(session: IFastingSession, now = Date.now()): PublicFastingSession {
   const remainingMs = Math.max(0, session.endsAt.getTime() - now);
   return {
-    id: session.id || String(session._id),
+    id: String(session._id),
     goalHours: session.goalHours,
     startedAt: session.startedAt.toISOString(),
     endsAt: session.endsAt.toISOString(),
