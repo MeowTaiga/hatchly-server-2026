@@ -9,35 +9,50 @@ import { env, isDev } from '../config/env.js';
  *
  * Includes:
  * - `helmet` — sets common security HTTP headers
- * - `cors` — open in dev (Expo runs from device IPs), locked to CLIENT_URL in prod
+ * - `cors` — open in dev (Expo runs from device IPs), locked allowlist in prod
  * - `hpp` — protects against HTTP parameter pollution
  * - JSON body parser with 16 MB size limit (aligned with MongoDB BSON doc cap)
  * - URL-encoded body parser
  */
 export function applySecurity(app: Express): void {
-  app.use(helmet());
+  // API is called cross-origin from hatchly.me — CORP must allow that.
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+    }),
+  );
 
-  const allowedOrigins = [
-    env.CLIENT_URL,
-    env.MARKETING_URL,
-    'https://hatchly.me',
-    'https://www.hatchly.me',
-  ].filter((origin): origin is string => Boolean(origin));
+  const allowedOrigins = new Set(
+    [
+      env.CLIENT_URL,
+      env.MARKETING_URL,
+      'https://hatchly.me',
+      'https://www.hatchly.me',
+      'http://localhost:5173',
+      'http://localhost:4173',
+      'http://127.0.0.1:5173',
+    ].filter((origin): origin is string => Boolean(origin)),
+  );
 
   app.use(
     cors({
       origin: isDev
         ? true
         : (origin, callback) => {
-            if (!origin || allowedOrigins.includes(origin)) {
+            // No Origin = same-origin / server-to-server — allow
+            if (!origin || allowedOrigins.has(origin)) {
               callback(null, true);
               return;
             }
-            callback(new Error(`CORS blocked for origin: ${origin}`));
+            // Important: callback(null, false) — do NOT throw, or OPTIONS returns 500
+            // without Access-Control-Allow-Origin and browsers report a CORS failure.
+            callback(null, false);
           },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization'],
+      optionsSuccessStatus: 204,
     }),
   );
 
