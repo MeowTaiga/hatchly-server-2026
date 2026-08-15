@@ -42,12 +42,13 @@ class PushService {
       .lean();
     const validTokens: string[] = [];
 
-    for (const { token } of tokens) {
-      if (Expo.isExpoPushToken(token)) {
-        validTokens.push(token);
-      } else {
-        log.warn({ userId, token: token.slice(0, 30) }, 'Invalid Expo push token, skipping');
-      }
+    for (const row of tokens) {
+      const raw = String(row.token);
+      // Not `if (isExpoPushToken(raw))`: the guard's type is a branded string,
+      // so the else branch narrows `raw` to never and we couldn't log it.
+      const valid: boolean = Expo.isExpoPushToken(raw);
+      if (valid) validTokens.push(raw);
+      else log.warn({ userId, token: raw.slice(0, 30) }, 'Invalid Expo push token, skipping');
     }
 
     if (validTokens.length === 0) {

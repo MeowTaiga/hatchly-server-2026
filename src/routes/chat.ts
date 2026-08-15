@@ -28,11 +28,24 @@ router.get(
   catchAsync(async (req, res) => {
     const userId = req.user!._id.toString();
     const timezone = (req.user as any).timezone;
-    const [messages, status] = await Promise.all([
-      getHistory(userId, timezone),
-      getChatStatus(userId, timezone),
-    ]);
-    success(res, { messages, needsMoodToday: status.needsMoodToday });
+    const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? ''), 10);
+    const limit = Number.isFinite(parsedLimit) ? parsedLimit : undefined;
+
+    const page = await getHistory(userId, { limit, before });
+
+    // Mood status only matters for the newest page — skip the extra lookup when paging back.
+    if (before) {
+      success(res, { messages: page.messages, hasMore: page.hasMore });
+      return;
+    }
+
+    const status = await getChatStatus(userId, timezone);
+    success(res, {
+      messages: page.messages,
+      hasMore: page.hasMore,
+      needsMoodToday: status.needsMoodToday,
+    });
   }),
 );
 

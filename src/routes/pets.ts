@@ -20,7 +20,7 @@ import {
 } from '../constants/pets.js';
 import { isValidPoseKey, POSE_PROMPTS } from '../constants/petPoses.js';
 import { petService } from '../services/PetService.js';
-
+import { createDefaultSkills } from '../services/SkillXpService.js';
 const log = createLogger('PetsRoute');
 const router = Router();
 
@@ -243,13 +243,19 @@ router.post(
       {
         pet: {
           name, customName, vibe, category, special, baseColor, secondaryColor, imageUrl,
-          level: 1, xp: 0, xpToNextLevel: 100,
+          level: 0, xp: 0, xpToNextLevel: 1,
         },
       },
       { new: true, runValidators: true },
     );
 
     if (!user) throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+
+    if (!user.skills) {
+      user.skills = createDefaultSkills();
+      user.markModified('skills');
+      await user.save();
+    }
 
     log.info({ userId, hasPet: !!user.pet }, '[save-draft] Pet draft saved successfully');
 
@@ -291,7 +297,7 @@ router.post(
       {
         pet: {
           name, customName, vibe, category, special, baseColor, secondaryColor, imageUrl,
-          level: 1, xp: 0, xpToNextLevel: 100,
+          level: 0, xp: 0, xpToNextLevel: 1,
         },
         onboardingComplete: true,
       },
@@ -299,6 +305,12 @@ router.post(
     );
 
     if (!user) throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+
+    if (!user.skills) {
+      user.skills = createDefaultSkills();
+      user.markModified('skills');
+      await user.save();
+    }
 
     success(res, {
       pet: user.pet,

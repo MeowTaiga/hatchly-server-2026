@@ -2,9 +2,10 @@ import { Farm } from '../models/Farm.js';
 import { GameItemDef, type IGameItemDef } from '../models/GameItemDef.js';
 import { FossilLootConfig, type IFossilLootEntry } from '../models/FossilLootConfig.js';
 import { UserCollection } from '../models/UserCollection.js';
-import { farmService } from './FarmService.js';
-import { questService } from './QuestService.js';
-import { resolveFarmLevel } from './FarmService.js';
+import { farmService, withQuestSync } from './FarmService.js';
+import { questService } from './quests/index.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import { attachSkillXp, skillXpService } from './SkillXpService.js';
 import { createLogger } from '../config/logger.js';
 import { RARITY_WEIGHTS, weightedPick } from '../utils/rarity.js';
 import type { StateUpdate } from './FarmService.js';
@@ -99,22 +100,18 @@ export async function digFossil(userId: string, anchorId: string): Promise<{
 
   log.info({ userId, anchorId, itemType: picked.itemType, qty }, 'Fossil dug');
 
-  await questService.trackAction(userId, 'dig_fossil', picked.itemType);
-  const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-  const freshFarm = autoCompleted.length > 0 ? await farmService.loadOrCreateFarm(userId) : farm;
-  const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-  const quests = await questService.getQuestsForUser(userId);
+  const sync = await questService.recordEvents(userId, { kind: 'action', action: 'dig_fossil', itemType: picked.itemType });
+  const skillGrant = await skillXpService.grant(userId, 'mining', SKILL_XP_REWARDS.dig_fossil);
 
-  const stateUpdate: StateUpdate = {
-    farmXp: freshFarm.xp,
-    gems: freshFarm.gems,
-    inventory: inventoryToRecord(freshFarm.inventory),
-    removedItemIds: [...removeIds],
-    quests,
-    farmLevel: lvl.level,
-    canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-    autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-  };
+  const stateUpdate: StateUpdate = attachSkillXp(
+    withQuestSync({
+      farmXp: farm.xp,
+      gems: farm.gems,
+      inventory: inventoryToRecord(farm.inventory),
+      removedItemIds: [...removeIds],
+    }, sync),
+    skillGrant,
+  );
 
   return {
     result: { anchorId: anchId, itemType: picked.itemType, label, qty },

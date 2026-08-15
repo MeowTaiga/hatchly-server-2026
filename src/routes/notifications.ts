@@ -79,8 +79,7 @@ router.patch(
     const userId = req.user?._id?.toString();
     if (!userId) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
 
-    const { id } = req.params;
-    await notificationService.markRead(id, userId);
+    await notificationService.markRead(String(req.params.id), userId);
 
     success(res, { read: true });
   }),

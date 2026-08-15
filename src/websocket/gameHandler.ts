@@ -1,12 +1,13 @@
 import type { AuthenticatedSocket } from '../types/socket.js';
 import { WS_EVENTS } from './events.js';
-import { farmService, type StateUpdate } from '../services/FarmService.js';
-import { questService } from '../services/QuestService.js';
+import { farmService, withQuestSync, type StateUpdate } from '../services/FarmService.js';
+import { questService } from '../services/quests/index.js';
 import { bugService, BUG_LIFESPAN_MS } from '../services/BugService.js';
 import { balloonService, BALLOON_LIFESPAN_MS } from '../services/BalloonService.js';
+import { startSpiritSnatch, submitSpiritSnatch } from '../services/SpiritSnatchService.js';
 import { spawnScheduler } from '../services/SpawnScheduler.js';
-import { cookingService, type CookInput } from '../services/CookingService.js';
-import { craftingService, type CraftInput } from '../services/CraftingService.js';
+import { cookingService } from '../services/CookingService.js';
+import { craftingService } from '../services/CraftingService.js';
 import { collectWater, getWellCooldown } from '../services/WellService.js';
 import { User } from '../models/User.js';
 import { GameItemDef } from '../models/GameItemDef.js';
@@ -15,7 +16,11 @@ import { petBehaviorStore } from '../services/PetBehaviorStore.js';
 import * as petAIService from '../services/PetAIService.js';
 import type { PetStateUpdatePayload } from '../services/PetAIService.js';
 import { digFossil } from '../services/FossilService.js';
-import { shakeTree } from '../services/TreeService.js';
+import { pickupGroundItem } from '../services/GroundPickupService.js';
+import { beginMine, cancelMine, completeMine } from '../services/MiningService.js';
+import { smeltingService } from '../services/SmeltingService.js';
+import { chopTree, shakeTree } from '../services/TreeService.js';
+
 import { findAdjacentWalkableForItem } from '../services/PetTargeting.js';
 import { multiplayerManager } from '../services/MultiplayerManager.js';
 import { getIO } from './index.js';
@@ -94,24 +99,13 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     });
   }
 
-  /** Emit a state update and, if any quests auto-completed, emit quest:completed for each. */
+  /**
+   * Quest results ride along on the state update rather than fanning out to
+   * separate quest events. There used to be three overlapping channels for the
+   * same information and the client needed dedup hacks to reconcile them.
+   */
   function emitStateUpdate(update: StateUpdate | Record<string, any>): void {
-    const autoCompleted = (update as StateUpdate).autoCompletedQuests;
-    if (autoCompleted?.length) {
-      // Strip from the state update payload (client handles via quest:completed)
-      const { autoCompletedQuests: _, ...cleanUpdate } = update as StateUpdate;
-      socket.emit(WS_EVENTS.GAME_STATE_UPDATE, cleanUpdate);
-      for (const ac of autoCompleted) {
-        const payload: Record<string, unknown> = { questId: ac.questId };
-        if (ac.endDialog) payload.endDialog = ac.endDialog;
-        if (ac.rewards) payload.rewards = ac.rewards;
-        if (ac.nextQuestId) payload.nextQuestId = ac.nextQuestId;
-        if (ac.nextQuestStartDialog) payload.nextQuestStartDialog = ac.nextQuestStartDialog;
-        socket.emit(WS_EVENTS.QUEST_COMPLETED, payload);
-      }
-    } else {
-      socket.emit(WS_EVENTS.GAME_STATE_UPDATE, update);
-    }
+    socket.emit(WS_EVENTS.GAME_STATE_UPDATE, update);
   }
 
   // ── Load full game state ────────────────────────────────────────────────
@@ -205,6 +199,17 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     } catch (err: any) {
       socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to shake tree' });
       log.warn({ userId, data, err: err.message }, 'game:shake_tree failed');
+    }
+  });
+
+  socket.on(WS_EVENTS.GAME_CHOP_TREE, async (data: { anchorId: string }) => {
+    try {
+      if (!data?.anchorId) throw new Error('Missing anchorId');
+      const result = await chopTree(userId, data.anchorId);
+      emitStateUpdate(result.stateUpdate);
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to chop tree' });
+      log.warn({ userId, data, err: err.message }, 'game:chop_tree failed');
     }
   });
 
@@ -325,6 +330,40 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     },
   );
 
+  socket.on(
+    WS_EVENTS.GAME_STORAGE_DEPOSIT,
+    async (data: { items?: Array<{ itemType: string; qty: number }> }) => {
+      try {
+        const items = (data?.items ?? [])
+          .filter((i) => i?.itemType && i?.qty > 0)
+          .map((i) => ({ itemType: i.itemType, qty: Math.max(1, Math.floor(i.qty)) }));
+        if (items.length === 0) throw new Error('No items to store');
+        const update = await farmService.depositToStorage(userId, items);
+        emitStateUpdate(update);
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to store items' });
+        log.warn({ userId, data, err: err.message }, 'game:storage_deposit failed');
+      }
+    },
+  );
+
+  socket.on(
+    WS_EVENTS.GAME_STORAGE_WITHDRAW,
+    async (data: { items?: Array<{ itemType: string; qty: number }> }) => {
+      try {
+        const items = (data?.items ?? [])
+          .filter((i) => i?.itemType && i?.qty > 0)
+          .map((i) => ({ itemType: i.itemType, qty: Math.max(1, Math.floor(i.qty)) }));
+        if (items.length === 0) throw new Error('No items to withdraw');
+        const update = await farmService.withdrawFromStorage(userId, items);
+        emitStateUpdate(update);
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to withdraw items' });
+        log.warn({ userId, data, err: err.message }, 'game:storage_withdraw failed');
+      }
+    },
+  );
+
   // ── Set equipped item ─────────────────────────────────────────────────
 
   socket.on(
@@ -339,12 +378,8 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
           data.slot,
           data.itemType ?? null,
         );
-        const questsAfterEquip = await questService.advanceStepIfMet(userId);
-        if (questsAfterEquip) {
-          emitStateUpdate({ ...update, quests: questsAfterEquip });
-        } else {
-          emitStateUpdate(update);
-        }
+        // Equip requirements are read live, so a re-sync may complete a quest.
+        emitStateUpdate(withQuestSync(update, await questService.sync(userId)));
         // Broadcast equipment change to multiplayer room so other players see it (bait not shown on avatar)
         const instance = multiplayerManager.getInstanceForUser(userId);
         const mpSlot = data.slot === 'handTool' || data.slot === 'bobber' || data.slot === 'chair' ? data.slot : null;
@@ -382,6 +417,31 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     }
   });
 
+  socket.on(WS_EVENTS.GAME_SPIRIT_SNATCH_START, async () => {
+    try {
+      const started = await startSpiritSnatch(userId);
+      socket.emit(WS_EVENTS.GAME_SPIRIT_SNATCH_START_RESULT, started);
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Spirit Snatch failed' });
+      log.warn({ userId, err: err.message }, 'game:spirit_snatch_start failed');
+    }
+  });
+
+  socket.on(WS_EVENTS.GAME_SPIRIT_SNATCH, async (data: {
+    roundId?: string;
+    taps?: { id: number; atMs: number }[];
+  }) => {
+    try {
+      if (!data?.roundId) throw new Error('Missing round');
+      const played = await submitSpiritSnatch(userId, data.roundId, data.taps ?? []);
+      socket.emit(WS_EVENTS.GAME_SPIRIT_SNATCH_RESULT, played.result);
+      emitStateUpdate(played.stateUpdate);
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Spirit Snatch failed' });
+      log.warn({ userId, data, err: err.message }, 'game:spirit_snatch failed');
+    }
+  });
+
   // ── Catch bug with net tool ───────────────────────────────────────────
 
   socket.on(WS_EVENTS.BUG_CATCH, async (data: { spawnId: string }) => {
@@ -405,39 +465,12 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
   socket.on(WS_EVENTS.QUEST_COMPLETE, async (data: { questId: string }) => {
     try {
       if (!data?.questId) throw new Error('Missing questId');
-      const result = await questService.completeQuest(userId, data.questId);
+      const sync = await questService.completeQuest(userId, data.questId);
+      emitStateUpdate(withQuestSync({}, sync));
 
-      // Always include farmLevel in QUEST_COMPLETED so client can update immediately
-      const farm = await farmService.loadOrCreateFarm(userId);
-      const level = await farmService.resolveFarmLevel(userId, farm.xp);
-
-      const completedPayload: Record<string, unknown> = {
-        questId: data.questId,
-        farmLevel: level.level,
-        inventory: result.inventory,
-        gems: result.gems,
-        quests: await questService.getQuestsForUser(userId),
-      };
-      if (result.newFarmLevel) completedPayload.newFarmLevel = result.newFarmLevel;
-      if (result.endDialog) completedPayload.endDialog = result.endDialog;
-      if (result.rewards) completedPayload.rewards = result.rewards;
-      if (result.nextQuestId) completedPayload.nextQuestId = result.nextQuestId;
-      if (result.nextQuestStartDialog) completedPayload.nextQuestStartDialog = result.nextQuestStartDialog;
-
-      socket.emit(WS_EVENTS.QUEST_COMPLETED, completedPayload);
-
-      // For farm upgrades, send a full snapshot so the client gets the new grid size
-      if (result.newFarmLevel) {
-        const snapshot = await farmService.getSnapshot(userId);
-        socket.emit(WS_EVENTS.GAME_SNAPSHOT, snapshot);
-      } else {
-        socket.emit(WS_EVENTS.GAME_STATE_UPDATE, {
-          farmXp: result.farmXp,
-          gems: result.gems,
-          farmLevel: level.level,
-          inventory: result.inventory,
-          quests: completedPayload.quests,
-        });
+      // A level-up changes the grid and the scenery, which only a snapshot carries.
+      if (sync.newFarmLevel) {
+        socket.emit(WS_EVENTS.GAME_SNAPSHOT, await farmService.getSnapshot(userId));
       }
     } catch (err: any) {
       socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to complete quest' });
@@ -445,95 +478,38 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     }
   });
 
-  // ── Activate quest by NPC ───────────────────────────────────────────
+  // ── Talk to an NPC ──────────────────────────────────────────────────
 
-  socket.on(WS_EVENTS.QUEST_ACTIVATE_BY_NPC, async (data: { npcItemType: string }) => {
+  socket.on(WS_EVENTS.QUEST_TALK_TO_NPC, async (data: { npcItemType: string }) => {
     try {
       if (!data?.npcItemType) return;
-      log.info({ userId, npcItemType: data.npcItemType }, 'quest:activate_by_npc received');
-      const [user, farm] = await Promise.all([
-        User.findById(userId).select('pet').lean(),
-        farmService.loadOrCreateFarm(userId),
-      ]);
-      const petLevel = user?.pet?.level ?? 1;
-      const farmLevel = (await farmService.resolveFarmLevel(userId, farm.xp)).level;
-      const result = await questService.tryActivateByTrigger(
-        userId,
-        'talk_to_npc',
-        { npcItemType: data.npcItemType },
-        { petLevel, farmLevel },
-      );
-      socket.emit(WS_EVENTS.QUEST_ACTIVATED, {
-        activated: result.activated,
-        quests: result.quests,
-      });
-      if (result.activated.length > 0 && !result.autoCompletedQuests?.length) {
-        socket.emit(WS_EVENTS.GAME_STATE_UPDATE, { quests: result.quests });
-      }
-      if (result.autoCompletedQuests?.length) {
-        const freshFarm = await farmService.loadOrCreateFarm(userId);
-        const lvl = await farmService.resolveFarmLevel(userId, freshFarm.xp);
-        const inv: Record<string, number> = {};
-        for (const [k, v] of freshFarm.inventory) {
-          if (v > 0) inv[k] = v;
-        }
-        emitStateUpdate({
-          quests: result.quests,
-          inventory: inv,
-          gems: freshFarm.gems,
-          farmLevel: lvl.level,
-          autoCompletedQuests: result.autoCompletedQuests,
-        });
-      }
+      const sync = await questService.talkToNpc(userId, data.npcItemType);
+      emitStateUpdate(withQuestSync({}, sync));
     } catch (err: any) {
-      log.warn({ userId, data, err: err.message }, 'quest:activate_by_npc failed');
+      socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to talk to NPC' });
+      log.warn({ userId, data, err: err.message }, 'quest:talk_to_npc failed');
     }
   });
 
-  // ── Activate quest by scene ─────────────────────────────────────────
+  // ── Enter a scene ───────────────────────────────────────────────────
 
-  socket.on(WS_EVENTS.QUEST_ACTIVATE_BY_SCENE, async (data: { sceneSlug: string }) => {
+  socket.on(WS_EVENTS.QUEST_ENTER_SCENE, async (data: { sceneSlug: string }) => {
     try {
       if (!data?.sceneSlug) return;
-      const [user, farm] = await Promise.all([
-        User.findById(userId).select('pet').lean(),
-        farmService.loadOrCreateFarm(userId),
-      ]);
-      const petLevel = user?.pet?.level ?? 1;
-      const farmLevel = (await farmService.resolveFarmLevel(userId, farm.xp)).level;
-      const result = await questService.tryActivateByTrigger(
-        userId,
-        'enter_scene',
-        { sceneSlug: data.sceneSlug },
-        { petLevel, farmLevel },
-      );
-      socket.emit(WS_EVENTS.QUEST_ACTIVATED, {
-        activated: result.activated,
-        quests: result.quests,
-      });
-      if (result.activated.length > 0) {
-        socket.emit(WS_EVENTS.GAME_STATE_UPDATE, { quests: result.quests });
-      }
+      const sync = await questService.enterScene(userId, data.sceneSlug);
+      emitStateUpdate(withQuestSync({}, sync));
     } catch (err: any) {
-      log.warn({ userId, data, err: err.message }, 'quest:activate_by_scene failed');
+      log.warn({ userId, data, err: err.message }, 'quest:enter_scene failed');
     }
   });
 
-  socket.on(WS_EVENTS.QUEST_NPC_DIALOG_DISMISSED, async (data: { npcItemType: string }) => {
-    try {
-      if (!data?.npcItemType) return;
-      const quests = await questService.trackNpcTalk(userId, data.npcItemType);
-      if (quests) socket.emit(WS_EVENTS.GAME_STATE_UPDATE, { quests });
-    } catch (err: any) {
-      log.warn({ userId, data, err: err.message }, 'quest:npc_dialog_dismissed failed');
-    }
-  });
+  // ── Opened a modal or screen ────────────────────────────────────────
 
   socket.on(WS_EVENTS.QUEST_MODAL_OPENED, async (data: { payload: string }) => {
     try {
       if (!data?.payload) return;
-      const quests = await questService.trackModalOpened(userId, data.payload);
-      if (quests) socket.emit(WS_EVENTS.GAME_STATE_UPDATE, { quests });
+      const sync = await questService.recordEvents(userId, { kind: 'modal_open', payload: data.payload });
+      emitStateUpdate(withQuestSync({}, sync));
     } catch (err: any) {
       log.warn({ userId, data, err: err.message }, 'quest:modal_opened failed');
     }
@@ -543,10 +519,11 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
 
   socket.on(
     WS_EVENTS.GAME_COOK,
-    async (data: { ingredients: CookInput[]; minigamePassed: boolean }) => {
+    async (data: { recipeId?: string; minigamePassed: boolean }) => {
       try {
-        if (!data?.ingredients?.length) throw new Error('Missing ingredients');
-        const result = await cookingService.attemptCook(userId, data.ingredients, data.minigamePassed);
+        const recipeId = data?.recipeId;
+        if (!recipeId) throw new Error('Missing recipe');
+        const result = await cookingService.attemptCook(userId, recipeId, data.minigamePassed);
         socket.emit(WS_EVENTS.GAME_COOK_RESULT, {
           matched: result.matched,
           resultItemType: result.resultItemType,
@@ -554,13 +531,24 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
           isNewDiscovery: result.isNewDiscovery,
           recipeId: result.recipeId,
           recipeLabel: result.recipeLabel,
-          recipeImageUrl: result.recipeImageUrl,
         });
-        emitStateUpdate({
+        const base = {
           inventory: result.inventory,
+          storage: result.storage,
           farmXp: result.farmXp,
           gems: result.gems,
+          ...(result.skillXp && { skillXp: result.skillXp }),
+        };
+        if (!result.matched || !result.resultItemType) {
+          emitStateUpdate(base);
+          return;
+        }
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'cook',
+          itemType: result.resultItemType,
         });
+        emitStateUpdate(withQuestSync(base, sync));
       } catch (err: any) {
         socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to cook' });
         log.warn({ userId, data, err: err.message }, 'game:cook failed');
@@ -584,7 +572,14 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
         });
         return;
       }
-      emitStateUpdate({ inventory: result.inventory });
+      // Counts one per trip to the well, not one per bucket — the yield is a
+      // random roll, so counting units would make authored targets unpredictable.
+      const sync = await questService.recordEvents(userId, {
+        kind: 'action',
+        action: 'collect_water',
+        itemType: 'water',
+      });
+      emitStateUpdate(withQuestSync({ inventory: result.inventory }, sync));
       socket.emit(WS_EVENTS.GAME_COLLECT_WATER_RESULT, {
         success: true,
         waterQty: result.waterQty,
@@ -600,10 +595,11 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
 
   socket.on(
     WS_EVENTS.GAME_CRAFT,
-    async (data: { ingredients: CraftInput[]; minigamePassed: boolean }) => {
+    async (data: { recipeId?: string; minigamePassed: boolean }) => {
       try {
-        if (!data?.ingredients?.length) throw new Error('Missing ingredients');
-        const result = await craftingService.attemptCraft(userId, data.ingredients, data.minigamePassed);
+        const recipeId = data?.recipeId;
+        if (!recipeId) throw new Error('Missing recipe');
+        const result = await craftingService.attemptCraft(userId, recipeId, data.minigamePassed);
         socket.emit(WS_EVENTS.GAME_CRAFT_RESULT, {
           matched: result.matched,
           resultItemType: result.resultItemType,
@@ -612,14 +608,134 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
           recipeId: result.recipeId,
           recipeLabel: result.recipeLabel,
         });
-        emitStateUpdate({
+        const base = {
           inventory: result.inventory,
+          storage: result.storage,
           farmXp: result.farmXp,
           gems: result.gems,
+          ...(result.backpackSlots != null && { backpackSlots: result.backpackSlots }),
+          ...(result.skillXp && { skillXp: result.skillXp }),
+        };
+        if (!result.matched || !result.resultItemType) {
+          emitStateUpdate(base);
+          return;
+        }
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'craft',
+          itemType: result.resultItemType,
         });
+        emitStateUpdate(withQuestSync(base, sync));
       } catch (err: any) {
         socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to craft' });
         log.warn({ userId, data, err: err.message }, 'game:craft failed');
+      }
+    },
+  );
+
+  socket.on(
+    WS_EVENTS.GAME_SMELT,
+    async (data: { recipeId?: string; minigamePassed: boolean }) => {
+      try {
+        const recipeId = data?.recipeId;
+        if (!recipeId) throw new Error('Missing recipe');
+        const result = await smeltingService.attemptSmelt(userId, recipeId, data.minigamePassed);
+        socket.emit(WS_EVENTS.GAME_SMELT_RESULT, {
+          matched: result.matched,
+          resultItemType: result.resultItemType,
+          resultQty: result.resultQty,
+          isNewDiscovery: result.isNewDiscovery,
+          recipeId: result.recipeId,
+          recipeLabel: result.recipeLabel,
+        });
+        const base = {
+          inventory: result.inventory,
+          storage: result.storage,
+          farmXp: result.farmXp,
+          gems: result.gems,
+          ...(result.skillXp && { skillXp: result.skillXp }),
+        };
+        if (!result.matched || !result.resultItemType) {
+          emitStateUpdate(base);
+          return;
+        }
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'smelt',
+          itemType: result.resultItemType,
+        });
+        emitStateUpdate(withQuestSync(base, sync));
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to smelt' });
+        log.warn({ userId, data, err: err.message }, 'game:smelt failed');
+      }
+    },
+  );
+
+  socket.on(
+    WS_EVENTS.GAME_LEARN_RECIPE,
+    async (data: { itemType?: string }) => {
+      const itemType = data?.itemType;
+      try {
+        if (!itemType) throw new Error('Missing recipe item');
+
+        let result:
+          | Awaited<ReturnType<typeof craftingService.learnFromScroll>>
+          | Awaited<ReturnType<typeof cookingService.learnFromScroll>>;
+        try {
+          result = await craftingService.learnFromScroll(userId, itemType);
+        } catch (craftErr: any) {
+          if (await cookingService.isCookingScroll(itemType)) {
+            result = await cookingService.learnFromScroll(userId, itemType);
+          } else {
+            throw craftErr;
+          }
+        }
+
+        socket.emit(WS_EVENTS.GAME_LEARN_RECIPE_RESULT, {
+          recipeId: result.recipeId,
+          recipeLabel: result.recipeLabel,
+          recipeItemType: result.recipeItemType,
+        });
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'learn',
+          itemType: result.recipeItemType,
+        });
+        emitStateUpdate(
+          withQuestSync(
+            {
+              inventory: result.inventory,
+              storage: result.storage,
+              farmXp: result.farmXp,
+              gems: result.gems,
+            },
+            sync,
+          ),
+        );
+      } catch (err: any) {
+        // Already-known still counts for quests that ask you to learn the scroll.
+        const msg = err.message ?? 'Failed to learn recipe';
+        if (/already know/i.test(msg) && itemType) {
+          try {
+            const sync = await questService.recordEvents(userId, {
+              kind: 'action',
+              action: 'learn',
+              itemType,
+            });
+            emitStateUpdate(withQuestSync({}, sync));
+            socket.emit(WS_EVENTS.GAME_LEARN_RECIPE_RESULT, {
+              recipeId: '',
+              recipeLabel: '',
+              recipeItemType: itemType,
+            });
+            return;
+          } catch {
+            // fall through to error emit
+          }
+        }
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: msg });
+        log.warn({ userId, data, err: err.message }, 'game:learn_recipe failed');
       }
     },
   );
@@ -737,6 +853,103 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
     }
   });
 
+  // ── Ground pickup (stone / stick) ──────────────────────────────────────
+
+  socket.on(WS_EVENTS.GROUND_PICKUP, async (data: { anchorId?: string }) => {
+    try {
+      const anchorId = data?.anchorId;
+      if (!anchorId || typeof anchorId !== 'string') {
+        throw new Error('Missing anchorId');
+      }
+      const { result, stateUpdate } = await pickupGroundItem(userId, anchorId);
+      emitStateUpdate(stateUpdate);
+      socket.emit(WS_EVENTS.GROUND_PICKED_UP, result);
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.GAME_ERROR, {
+        message: err.message ?? 'Failed to pick up',
+      });
+      log.warn({ userId, data, err: err.message }, 'ground:pickup failed');
+    }
+  });
+
+  // ── Mine ore tile ──────────────────────────────────────────────────────
+
+  socket.on(
+    WS_EVENTS.MINE_ORE_BEGIN,
+    async (data: { sceneSlug?: string; col?: number; row?: number }) => {
+      try {
+        const sceneSlug = data?.sceneSlug;
+        const col = data?.col;
+        const row = data?.row;
+        if (!sceneSlug || typeof sceneSlug !== 'string') throw new Error('Missing sceneSlug');
+        if (typeof col !== 'number' || typeof row !== 'number') throw new Error('Missing col/row');
+        const { ready, stateUpdate } = await beginMine(userId, sceneSlug, col, row);
+        emitStateUpdate(stateUpdate);
+        socket.emit(WS_EVENTS.MINE_ORE_READY, ready);
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to mine' });
+        log.warn({ userId, data, err: err.message }, 'mine:ore_begin failed');
+      }
+    },
+  );
+
+  socket.on(WS_EVENTS.MINE_ORE_CANCEL, async () => {
+    try {
+      const stateUpdate = await cancelMine(userId);
+      if (stateUpdate) emitStateUpdate(stateUpdate);
+    } catch (err: any) {
+      log.warn({ userId, err: err.message }, 'mine:ore_cancel failed');
+    }
+  });
+
+  socket.on(
+    WS_EVENTS.MINE_ORE_COMPLETE,
+    async (data: {
+      sceneSlug?: string;
+      col?: number;
+      row?: number;
+      taps?: number;
+      elapsedMs?: number;
+      passed?: boolean;
+    }) => {
+      try {
+        const sceneSlug = data?.sceneSlug;
+        const col = data?.col;
+        const row = data?.row;
+        if (!sceneSlug || typeof col !== 'number' || typeof row !== 'number') {
+          throw new Error('Missing mine target');
+        }
+        const { result, stateUpdate } = await completeMine(userId, {
+          sceneSlug,
+          col,
+          row,
+          taps: typeof data.taps === 'number' ? data.taps : 0,
+          elapsedMs: typeof data.elapsedMs === 'number' ? data.elapsedMs : 99_999,
+          passed: data.passed === true,
+        });
+        if (stateUpdate) emitStateUpdate(stateUpdate);
+        socket.emit(WS_EVENTS.MINE_ORE_RESULT, result);
+        if (result.passed) {
+          const payload = {
+            userId,
+            itemType: result.itemType,
+            label: result.label,
+            qty: result.qty,
+            rarity: result.rarity ?? 'common',
+            imageUrl: result.imageUrl,
+            kind: 'ore' as const,
+          };
+          socket.emit(WS_EVENTS.MP_ORE_MINED, payload);
+          const instance = multiplayerManager.getInstanceForUser(userId);
+          if (instance) socket.to(instance.roomName).emit(WS_EVENTS.MP_ORE_MINED, payload);
+        }
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Failed to mine' });
+        log.warn({ userId, data, err: err.message }, 'mine:ore_complete failed');
+      }
+    },
+  );
+
   /** Runs every 5s; if pet stuck in sleep/eat/walk, force idle and push to client. */
   const validateInterval = setInterval(() => {
     const correct = petBehaviorStore.validateAndCorrect(userId);
@@ -763,7 +976,20 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
         if (!data?.anchorId || !data?.foodItemType) throw new Error('Missing anchorId or foodItemType');
         const removeUpdate = await farmService.removeItem(userId, data.anchorId, { consume: true });
         const feedResult = await cookingService.feedPet(userId, data.foodItemType);
-        emitStateUpdate(removeUpdate);
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'feed_pet',
+          itemType: data.foodItemType,
+        });
+        emitStateUpdate(
+          withQuestSync(
+            {
+              ...removeUpdate,
+              ...(feedResult.skillXp && { skillXp: feedResult.skillXp }),
+            },
+            sync,
+          ),
+        );
         if (feedResult.pet) {
           socket.emit(WS_EVENTS.PET_UPDATED, { pet: feedResult.pet });
         }
@@ -803,7 +1029,20 @@ export function registerGameHandlers(socket: AuthenticatedSocket): void {
           return;
         }
         const feedResult = await cookingService.feedPet(userId, consumed.itemType);
-        emitStateUpdate(consumed.update);
+        const sync = await questService.recordEvents(userId, {
+          kind: 'action',
+          action: 'feed_pet',
+          itemType: consumed.itemType,
+        });
+        emitStateUpdate(
+          withQuestSync(
+            {
+              ...consumed.update,
+              ...(feedResult.skillXp && { skillXp: feedResult.skillXp }),
+            },
+            sync,
+          ),
+        );
         if (feedResult.pet) {
           socket.emit(WS_EVENTS.PET_UPDATED, { pet: feedResult.pet });
         }

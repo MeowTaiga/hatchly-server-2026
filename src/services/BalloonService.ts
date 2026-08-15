@@ -2,8 +2,8 @@ import crypto from 'crypto';
 import { Farm } from '../models/Farm.js';
 import { GameItemDef } from '../models/GameItemDef.js';
 import { BalloonLootConfig } from '../models/BalloonLootConfig.js';
-import { farmService } from './FarmService.js';
-import { questService } from './QuestService.js';
+import { farmService, withQuestSync } from './FarmService.js';
+import { questService } from './quests/index.js';
 import { createLogger } from '../config/logger.js';
 import { RARITY_WEIGHTS, RARITY_GEM_MULTIPLIER, weightedPick } from '../utils/rarity.js';
 import type { BugRarity } from '../models/GameItemDef.js';
@@ -159,10 +159,11 @@ export const balloonService = {
 
     log.info({ userId, spawnId, itemType, qty }, 'Balloon popped');
 
-    await questService.trackAction(userId, 'pop_balloon', itemType || 'gems');
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await Farm.findOne({ userId }) : farm;
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, {
+      kind: 'action',
+      action: 'pop_balloon',
+      itemType: itemType || 'gems',
+    });
 
     const popResult: BalloonPopResult = {
       spawnId,
@@ -173,20 +174,18 @@ export const balloonService = {
     };
 
     const inventoryRecord: Record<string, number> = {};
-    if (freshFarm) {
-      for (const [k, v] of freshFarm.inventory) {
+    if (farm) {
+      for (const [k, v] of farm.inventory) {
         if (v > 0) inventoryRecord[k] = v;
       }
     }
 
     return {
       popResult,
-      stateUpdate: {
-        gems: freshFarm?.gems ?? 0,
+      stateUpdate: withQuestSync({
+        gems: farm?.gems ?? 0,
         inventory: inventoryRecord,
-        quests,
-        autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-      },
+      }, sync),
     };
   },
 

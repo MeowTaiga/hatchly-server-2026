@@ -3,6 +3,14 @@ import { Subscription } from '../models/Subscription.js';
 import { signJwt } from '../utils/token.js';
 import { formatE164 } from '../utils/phone.js';
 import { AppError } from '../middleware/errorHandler.js';
+import {
+  createDefaultSkills,
+  ensureUserSkills,
+  syncPetTotalLevelFromSkills,
+  toPublicSkills,
+  totalSkillLevel,
+  type PublicSkills,
+} from '../services/SkillXpService.js';
 
 /** Sanitised pet sub-object included in API responses */
 export interface PublicPet {
@@ -12,9 +20,17 @@ export interface PublicPet {
   category: string;
   imageUrl: string;
   pose?: Record<string, string>;
+  hunger?: number;
+  happy?: number;
+  mood?: number;
+  /** Total skill level (sum of all skills). */
   level: number;
+  /** @deprecated Always 0 */
   xp: number;
+  /** @deprecated Always 1 */
   xpToNextLevel: number;
+  skills?: PublicSkills;
+  totalLevel?: number;
 }
 
 /** Subscription summary included in API responses */
@@ -37,6 +53,8 @@ export interface PublicUser {
   theme: 'light' | 'dark';
   accentColor?: string;
   pet?: PublicPet;
+  skills?: PublicSkills;
+  totalLevel?: number;
   subscription?: PublicSubscription | null;
 }
 
@@ -87,7 +105,7 @@ export class UserEntity {
       return { entity: new UserEntity(doc), isNewUser: false };
     }
 
-    doc = await User.create({ phone });
+    doc = await User.create({ phone, skills: createDefaultSkills() });
     return { entity: new UserEntity(doc), isNewUser: true };
   }
 
@@ -107,20 +125,35 @@ export class UserEntity {
 
   /** Returns a sanitised user object with no internal Mongoose fields */
   async toPublic(): Promise<PublicUser> {
+    // Backfill skills + sync average skill level onto pet for older accounts.
+    const skills = ensureUserSkills(this.doc);
+    const totalLevel = totalSkillLevel(skills);
+    const publicSkills = toPublicSkills(skills);
+    if (this.doc.pet) {
+      syncPetTotalLevelFromSkills(this.doc);
+    }
+    if (this.doc.isModified('skills') || this.doc.isModified('pet')) {
+      await this.doc.save();
+    }
+
     const pet = this.doc.pet
       ? {
           name: this.doc.pet.name,
           customName: this.doc.pet.customName,
           vibe: this.doc.pet.vibe,
           category: this.doc.pet.category,
+          baseColor: this.doc.pet.baseColor,
+          secondaryColor: this.doc.pet.secondaryColor,
           imageUrl: this.doc.pet.imageUrl,
           pose: this.doc.pet.pose,
           hunger: this.doc.pet.hunger ?? 100,
           happy: this.doc.pet.happy ?? 100,
           mood: this.doc.pet.mood ?? 100,
-          level: this.doc.pet.level,
-          xp: this.doc.pet.xp,
-          xpToNextLevel: this.doc.pet.xpToNextLevel,
+          level: totalLevel,
+          xp: 0,
+          xpToNextLevel: 1,
+          skills: publicSkills,
+          totalLevel,
         }
       : undefined;
 
@@ -146,6 +179,8 @@ export class UserEntity {
       theme: (this.doc.theme ?? 'light') as 'light' | 'dark',
       accentColor: this.doc.accentColor ?? undefined,
       pet,
+      skills: publicSkills,
+      totalLevel,
       subscription,
     };
   }

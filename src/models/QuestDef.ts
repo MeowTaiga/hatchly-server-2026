@@ -1,42 +1,55 @@
 import mongoose, { type Document, Schema } from 'mongoose';
 import { basePlugin } from './plugins/basePlugin.js';
+import {
+  DIALOG_HIGHLIGHT_TYPES,
+  EQUIP_SLOTS,
+  QUEST_TRIGGER_TYPES,
+  QUEST_TYPES,
+} from '../services/quests/constants.js';
 
 export interface IQuestRequirement {
-  /** Items consumed on quest completion. */
+  /** Items the player must hold. Consumed on completion. */
   items?: { itemType: string; qty: number }[];
-  /** Buildings that must be placed on the farm (not consumed). */
+  /** Buildings that must be placed on the farm. Not consumed. */
   buildings?: { itemType: string; count: number }[];
-  /** Cumulative action counts tracked while quest is active. Optional itemType for item-specific tracking. */
+  /** Cumulative action counts, tallied while the quest is active. */
   actions?: { action: string; count: number; itemType?: string }[];
-  /** Equipment that must be equipped (slot + optional itemType filter). */
-  equips?: { slot: string; itemType?: string; count?: number }[];
-  /** Talk to NPC (counted when user finishes NPC dialog). */
+  /** Gear that must be worn. A slot holds one item, so there is no count. */
+  equips?: { slot: string; itemType?: string }[];
+  /** Conversations finished with an NPC. */
   talk_to_npc?: { npcItemType: string; count?: number }[];
-  /** Crop reached harvestable state. */
+  /** Crops that reached harvestable. */
   crop_grown?: { itemType: string; count?: number }[];
-  /** User opened modal (e.g. cooking, crafting). */
+  /** Modals or screens opened, keyed by an item's interact payload. */
   open_modal?: { payload: string; count?: number }[];
+  /** Total farm XP the player must have reached. */
+  farmXp?: number;
 }
 
 export interface IQuestReward {
   items?: { itemType: string; qty: number }[];
   gems?: number;
   xp?: number;
+  /** Crafting recipe ids unlocked on completion (no scroll needed). */
+  recipes?: string[];
 }
 
-export type QuestType = 'farm_upgrade' | 'story' | 'daily';
+export type QuestType = (typeof QUEST_TYPES)[number];
 
-export type QuestTriggerType = 'quest_complete' | 'talk_to_npc' | 'enter_scene' | 'manual' | 'start';
+export type QuestTriggerType = (typeof QUEST_TRIGGER_TYPES)[number];
 
 export interface IQuestTrigger {
   type: QuestTriggerType;
+  /** For `quest_complete`. */
   questId?: string;
+  /** For `talk_to_npc`. */
   npcItemType?: string;
+  /** For `enter_scene`. */
   sceneSlug?: string;
   firstVisitOnly?: boolean;
 }
 
-export type DialogHighlightType = 'hud_button' | 'inventory_item' | 'world_item' | 'category_chip' | 'shop_item' | 'shop_category';
+export type DialogHighlightType = (typeof DIALOG_HIGHLIGHT_TYPES)[number];
 
 export interface IDialogHighlight {
   type: DialogHighlightType;
@@ -46,25 +59,10 @@ export interface IDialogHighlight {
 export interface IDialogStep {
   text: string;
   highlight?: IDialogHighlight;
-  /** If false, user can dismiss dialog without completing highlight. */
+  /** When false the player can dismiss the line without satisfying the highlight. */
   blocking?: boolean;
-  /** Override speaker for this step: 'pet' | 'npc'. Falls back to dialog-level speaker if unset. */
+  /** Overrides the dialog-level speaker for this line. */
   speaker?: 'pet' | 'npc';
-}
-
-export interface IQuestStep {
-  stepId: string;
-  requirements: IQuestRequirement;
-  /** Dialog shown when step becomes active. */
-  dialogBefore?: IDialogStep[];
-  /** Dialog shown when step completes. */
-  dialogAfter?: IDialogStep[];
-  /** If false, user can dismiss dialog; step continues in background. */
-  blocking?: boolean;
-  /** Optional per-step rewards. */
-  rewards?: IQuestReward;
-  /** Explicit next step; if omitted, next is by array order. */
-  nextStepId?: string;
 }
 
 export interface IQuestDef extends Document {
@@ -72,31 +70,30 @@ export interface IQuestDef extends Document {
   type: QuestType;
   title: string;
   description: string;
-  /** For farm_upgrade quests: which farm level this unlocks. */
+  /**
+   * For `farm_upgrade` quests: the level this quest raises the farm to. The
+   * quest becomes available when the farm is one level below it.
+   */
   farmLevel?: number;
-  /** Minimum pet level required to activate this quest. */
+  /** Gates: the quest cannot open until these pass. */
   petLevelMin?: number;
-  /** Minimum farm level required to activate this quest. */
   farmLevelMin?: number;
-  /** Quest that must be completed before this quest can be activated. */
   requiredQuestId?: string;
   requirements: IQuestRequirement;
   rewards: IQuestReward;
   sortOrder: number;
-  /** Dialog steps shown when this quest becomes active. */
   startDialog?: IDialogStep[];
-  /** Dialog steps shown after this quest is completed. */
   endDialog?: IDialogStep[];
-  /** Speaker for start dialog when talk_to_npc trigger: 'pet' | 'npc'. Default 'npc'. */
+  /**
+   * Shown when the player taps the NPC while this quest is active but not
+   * ready to turn in (open-book bubble). Custom reminder copy per quest.
+   */
+  progressDialog?: IDialogStep[];
   startDialogSpeaker?: 'pet' | 'npc';
-  /** Speaker for end dialog when talk_to_npc in requirements: 'pet' | 'npc'. Default 'npc'. */
   endDialogSpeaker?: 'pet' | 'npc';
-  /** questId of the next quest to auto-activate on completion. @deprecated Use triggers instead. */
-  autoTrigger?: string;
-  /** Modular triggers: quest can be activated by any of these. */
+  progressDialogSpeaker?: 'pet' | 'npc';
+  /** How the quest opens. Empty is treated as `start`. */
   triggers?: IQuestTrigger[];
-  /** Multi-step quest flow. If present, requirements per step; else use top-level requirements (legacy). */
-  steps?: IQuestStep[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -105,11 +102,16 @@ const questRequirementSchema = new Schema<IQuestRequirement>(
   {
     items: [{ itemType: { type: String, required: true }, qty: { type: Number, required: true, min: 1 } }],
     buildings: [{ itemType: { type: String, required: true }, count: { type: Number, required: true, min: 1 } }],
-    actions: [{ action: { type: String, required: true }, count: { type: Number, required: true, min: 1 }, itemType: { type: String } }],
-    equips: [{ slot: { type: String, required: true }, itemType: { type: String }, count: { type: Number, default: 1, min: 1 } }],
+    actions: [{
+      action: { type: String, required: true },
+      count: { type: Number, required: true, min: 1 },
+      itemType: { type: String },
+    }],
+    equips: [{ slot: { type: String, required: true, enum: EQUIP_SLOTS }, itemType: { type: String } }],
     talk_to_npc: [{ npcItemType: { type: String, required: true }, count: { type: Number, default: 1, min: 1 } }],
     crop_grown: [{ itemType: { type: String, required: true }, count: { type: Number, default: 1, min: 1 } }],
     open_modal: [{ payload: { type: String, required: true }, count: { type: Number, default: 1, min: 1 } }],
+    farmXp: { type: Number, min: 1 },
   },
   { _id: false },
 );
@@ -119,13 +121,14 @@ const questRewardSchema = new Schema<IQuestReward>(
     items: [{ itemType: { type: String, required: true }, qty: { type: Number, required: true, min: 1 } }],
     gems: { type: Number, min: 0 },
     xp: { type: Number, min: 0 },
+    recipes: [{ type: String }],
   },
   { _id: false },
 );
 
 const dialogHighlightSchema = new Schema(
   {
-    type: { type: String, required: true, enum: ['hud_button', 'inventory_item', 'world_item', 'category_chip', 'shop_item', 'shop_category'] },
+    type: { type: String, required: true, enum: DIALOG_HIGHLIGHT_TYPES },
     target: { type: String, required: true },
   },
   { _id: false },
@@ -141,23 +144,10 @@ const dialogStepSchema = new Schema(
   { _id: false },
 );
 
-const questStepSchema = new Schema(
-  {
-    stepId: { type: String, required: true },
-    requirements: { type: questRequirementSchema, default: {} },
-    dialogBefore: { type: [dialogStepSchema], default: undefined },
-    dialogAfter: { type: [dialogStepSchema], default: undefined },
-    blocking: { type: Boolean, default: true },
-    rewards: { type: questRewardSchema, default: undefined },
-    nextStepId: { type: String },
-  },
-  { _id: false },
-);
-
 const questDefSchema = new Schema<IQuestDef>(
   {
     questId: { type: String, required: true, unique: true, index: true },
-    type: { type: String, required: true, enum: ['farm_upgrade', 'story', 'daily'] },
+    type: { type: String, required: true, enum: QUEST_TYPES },
     title: { type: String, required: true },
     description: { type: String, default: '' },
     farmLevel: { type: Number },
@@ -169,17 +159,17 @@ const questDefSchema = new Schema<IQuestDef>(
     sortOrder: { type: Number, default: 0 },
     startDialog: { type: [dialogStepSchema], default: undefined },
     endDialog: { type: [dialogStepSchema], default: undefined },
+    progressDialog: { type: [dialogStepSchema], default: undefined },
     startDialogSpeaker: { type: String, enum: ['pet', 'npc'] },
     endDialogSpeaker: { type: String, enum: ['pet', 'npc'] },
-    autoTrigger: { type: String },
+    progressDialogSpeaker: { type: String, enum: ['pet', 'npc'] },
     triggers: [{
-      type: { type: String, enum: ['quest_complete', 'talk_to_npc', 'enter_scene', 'manual', 'start'] },
+      type: { type: String, enum: QUEST_TRIGGER_TYPES },
       questId: { type: String },
       npcItemType: { type: String },
       sceneSlug: { type: String },
       firstVisitOnly: { type: Boolean },
     }],
-    steps: { type: [questStepSchema], default: undefined },
   },
   { timestamps: true },
 );

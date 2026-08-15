@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
 import { createServer } from 'http';
 import express from 'express';
-import { env } from './config/env.js';
+import { env, isDev } from './config/env.js';
 import { logger } from './config/logger.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { applySecurity } from './middleware/security.js';
@@ -17,6 +17,8 @@ import subscriptionRoutes from './routes/subscription.js';
 import foodRoutes from './routes/food.js';
 import weightRoutes from './routes/weight.js';
 import waterRoutes from './routes/water.js';
+import fastingRoutes from './routes/fasting.js';
+import goalsRoutes from './routes/goals.js';
 import moodRoutes from './routes/mood.js';
 import achievementRoutes from './routes/achievements.js';
 import adminRoutes from './routes/admin.js';
@@ -25,6 +27,8 @@ import friendsRoutes from './routes/friends.js';
 import mailRoutes from './routes/mail.js';
 import notificationsRoutes from './routes/notifications.js';
 import chatRoutes from './routes/chat.js';
+import waitlistRoutes from './routes/waitlist.js';
+import devAuthRoutes from './routes/devAuth.js';
 
 // ─── Crash traps — catch EVERYTHING so we see the real error ─────────────────
 
@@ -91,6 +95,8 @@ async function bootstrap(): Promise<void> {
   app.use('/food', foodRoutes);
   app.use('/weight', weightRoutes);
   app.use('/water', waterRoutes);
+  app.use('/fasting', fastingRoutes);
+  app.use('/goals', goalsRoutes);
   app.use('/mood', moodRoutes);
   app.use('/achievements', achievementRoutes);
   app.use('/admin', adminRoutes);
@@ -99,6 +105,12 @@ async function bootstrap(): Promise<void> {
   app.use('/mail', mailRoutes);
   app.use('/notifications', notificationsRoutes);
   app.use('/chat', chatRoutes);
+  app.use('/waitlist', waitlistRoutes);
+
+  if (isDev) {
+    app.use('/dev-auth', devAuthRoutes);
+    logger.warn('Dev auth routes enabled at /dev-auth — never run this in production');
+  }
 
   app.use((req, _res, next) => {
     next(new AppError(`Route ${req.method} ${req.originalUrl} not found`, 404, 'NOT_FOUND'));

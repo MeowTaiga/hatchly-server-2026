@@ -8,7 +8,8 @@ import { UserProgress } from '../models/UserProgress.js';
 import { Achievement } from '../models/Achievement.js';
 import { DailyLoginReward } from '../models/DailyLoginReward.js';
 import { UserCollection } from '../models/UserCollection.js';
-import { OnboardingProfile } from '@/models/OnboardingProfile.js';
+import { OnboardingProfile } from '../models/OnboardingProfile.js';
+import { FastingSession } from '../models/FastingSession.js';
 
 /**
  * Collection keys the pet AI may query. Explicit whitelist — no dynamic names.
@@ -23,7 +24,8 @@ export const PET_DATA_COLLECTION_KEYS = [
   'user_progress',
   'achievements',
   'daily_login_rewards',
-  'onboarding_profile'
+  'onboarding_profile',
+  'fasting_sessions',
 ] as const;
 
 export type PetDataCollectionKey = (typeof PET_DATA_COLLECTION_KEYS)[number];
@@ -58,7 +60,7 @@ export const PET_DATA_COLLECTIONS: Record<PetDataCollectionKey, PetDataCollectio
     model: MoodLog,
     userIdField: 'userId',
     dateField: 'date',
-    descriptionForAI: 'Daily mood check-ins (great, good, okay, meh, down, anxious, excited). Use when user asks about their mood history or how they have been feeling.',
+    descriptionForAI: 'Mood diary entries (multiple per day). Fields: mood (great/good/okay/meh/down/anxious/excited), optional note, date, createdAt, rewarded. Use when user asks about mood history, diary notes, or how they have been feeling.',
   },
   weight_logs: {
     model: WeightLog,
@@ -97,6 +99,12 @@ export const PET_DATA_COLLECTIONS: Record<PetDataCollectionKey, PetDataCollectio
     model: OnboardingProfile,
     userIdField: 'userId',
     descriptionForAI: 'Has the Users height, starting weight as "currentWeight", and goal weight as "goalWeight". Use when user asks about their height, starting weight, or goal weight.',
+  },
+  fasting_sessions: {
+    model: FastingSession,
+    userIdField: 'userId',
+    dateField: 'date',
+    descriptionForAI: 'Intermittent fasting timers. Fields: goalHours, startedAt, endsAt, endedAt, status (active/completed/broken), date. Use when the user asks about fasting, eating windows, or their current fast.',
   },
 };
 

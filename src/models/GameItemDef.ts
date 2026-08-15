@@ -1,6 +1,7 @@
 import mongoose, { type Document, Schema } from 'mongoose';
 import { basePlugin } from './plugins/basePlugin.js';
 import type { IDialogStep } from './QuestDef.js';
+import { DIALOG_HIGHLIGHT_TYPES } from '../services/quests/constants.js';
 
 export interface IHarvestDrop {
   itemType: string;
@@ -10,10 +11,22 @@ export interface IHarvestDrop {
 /** Defines what happens when a user taps a placed item outside of edit mode. */
 export type InteractActionType = 'open_scene' | 'open_modal' | 'start_dialog' | 'none';
 
+/** Live inventory/equip checks for gating an interact (quest-requirement subset). */
+export interface IInteractRequirements {
+  items?: { itemType: string; qty: number }[];
+  equips?: { slot: string; itemType?: string }[];
+}
+
 export interface IInteractAction {
   type: InteractActionType;
   /** Scene name, modal id, dialog key, etc. */
   payload?: string;
+  /** Minimum farm level required to use this action. */
+  farmLevelMin?: number;
+  /** Minimum pet level required to use this action. */
+  petLevelMin?: number;
+  /** Must hold / equip these (possession only — not consumed). */
+  requirements?: IInteractRequirements;
 }
 
 /** The 6 unique fence shapes — rotated on the client to produce all 16 bitmask variants. */
@@ -80,8 +93,17 @@ export interface IGameItemDef extends Document {
   farmLevel?: number;
   /** Minimum pet level required to purchase this item. */
   petLevel?: number;
+  /** Minimum farming skill level required to purchase this item (shop seeds). */
+  farmingSkillLevel?: number;
   /** Shop section key (e.g. 'seasonal', 'easter') — item appears in this section. */
   shopSection?: string;
+  /**
+   * Inventory itemType spent instead of gems when buying this (e.g. 'candy_corn').
+   * Empty/undefined = pay with gems. Amount is still `gemPrice`.
+   */
+  shopCurrency?: string;
+  /** When true, this item is a wallet currency shown on the HUD when the player has some. */
+  isCurrency?: boolean;
   /** Whether this item can be sold back to the shop for gems. */
   sellable?: boolean;
   /** Gems awarded per item when sold. Undefined = use category-based default. */
@@ -98,10 +120,14 @@ export interface IGameItemDef extends Document {
   bugRarity?: BugRarity;
   /** Time of day when this bug can spawn. */
   bugActiveTime?: BugActiveTime;
-  /** SubCategories this bug spawns on. Empty/undefined = spawn anywhere. */
+  /** SubCategories / habitats this bug spawns on. Empty/undefined = spawn anywhere. */
   bugSpawnOn?: string[];
+  /** When set to 'rain', this bug only spawns during rain weather. */
+  bugWeather?: 'rain';
   /** Scene slugs this bug can spawn in. Empty/undefined = all scenes. */
   bugScenes?: string[];
+  /** Soft tags for themed collection sets (e.g. 'haunted'). */
+  bugCollectionTags?: string[];
   /** Minimum rolled size when this fish is caught (fish-specific). */
   fishSizeMin?: number;
   /** Maximum rolled size when this fish is caught (fish-specific). */
@@ -110,8 +136,10 @@ export interface IGameItemDef extends Document {
   fishRarity?: BugRarity;
   /** Time of day when this fish can spawn. */
   fishActiveTime?: BugActiveTime;
-  /** Spot types (river, ocean, pond, general) where this fish can be caught. Empty/undefined = all spots. */
+  /** Spot types (river, ocean, pond, lake, reef, general) where this fish can be caught. Empty/undefined = all spots. */
   fishSpotTypes?: string[];
+  /** Soft tags for themed collection sets (e.g. 'ghost'). */
+  fishCollectionTags?: string[];
   /** Light emission radius in tiles (e.g. 3 = 3 tiles around the item). */
   lightRadius?: number;
   /** Hex color of the emitted light (e.g. '#FFDD88'). */
@@ -134,6 +162,19 @@ export interface IGameItemDef extends Document {
   treeFruit?: string;
   /** For fruit items (subCategory 'fruit'): tree variant slugs this fruit can grow on (e.g. ['oak', 'dark_oak']). */
   growsOnTrees?: string[];
+  /**
+   * Pet equip overlay transform for hand tools / chairs.
+   * Coordinates are CSS left/bottom (px) in a PET_SIZE=96 frame.
+   * Missing fields fall back to client defaults.
+   */
+  equipOverlay?: {
+    x?: number;
+    y?: number;
+    flipX?: boolean;
+    flipY?: boolean;
+    rotationDeg?: number;
+    scale?: number;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -148,7 +189,7 @@ const harvestDropSchema = new Schema<IHarvestDrop>(
 
 const npcDialogHighlightSchema = new Schema(
   {
-    type: { type: String, required: true, enum: ['hud_button', 'inventory_item', 'world_item', 'category_chip', 'shop_item', 'shop_category'] },
+    type: { type: String, required: true, enum: DIALOG_HIGHLIGHT_TYPES },
     target: { type: String, required: true },
   },
   { _id: false },
@@ -184,6 +225,39 @@ const gameItemDefSchema = new Schema<IGameItemDef>({
       {
         type: { type: String, enum: ['open_scene', 'open_modal', 'start_dialog', 'none'], required: true },
         payload: { type: String },
+        farmLevelMin: { type: Number, min: 1 },
+        petLevelMin: { type: Number, min: 1 },
+        requirements: {
+          type: new Schema(
+            {
+              items: {
+                type: [
+                  new Schema(
+                    {
+                      itemType: { type: String, required: true },
+                      qty: { type: Number, required: true, min: 1 },
+                    },
+                    { _id: false },
+                  ),
+                ],
+                default: undefined,
+              },
+              equips: {
+                type: [
+                  new Schema(
+                    {
+                      slot: { type: String, required: true },
+                      itemType: { type: String },
+                    },
+                    { _id: false },
+                  ),
+                ],
+                default: undefined,
+              },
+            },
+            { _id: false },
+          ),
+        },
       },
       { _id: false },
     ),
@@ -207,7 +281,10 @@ const gameItemDefSchema = new Schema<IGameItemDef>({
   gemPrice: { type: Number, default: 0, min: 0 },
   farmLevel: { type: Number, default: undefined, min: 0 },
   petLevel: { type: Number, default: undefined, min: 0 },
+  farmingSkillLevel: { type: Number, default: undefined, min: 0 },
   shopSection: { type: String, default: undefined },
+  shopCurrency: { type: String, default: undefined },
+  isCurrency: { type: Boolean, default: false },
   sellable: { type: Boolean, default: false },
   sellPrice: { type: Number, default: undefined, min: 0 },
   availableUntil: { type: Date, default: undefined },
@@ -217,12 +294,15 @@ const gameItemDefSchema = new Schema<IGameItemDef>({
   bugRarity: { type: String, enum: BUG_RARITIES, default: 'common' },
   bugActiveTime: { type: String, enum: BUG_ACTIVE_TIMES, default: 'all_day' },
   bugSpawnOn: { type: [String], default: undefined },
+  bugWeather: { type: String, enum: ['rain'], default: undefined },
   bugScenes: { type: [String], default: undefined },
+  bugCollectionTags: { type: [String], default: undefined },
   fishSizeMin: { type: Number, default: undefined, min: 0.1 },
   fishSizeMax: { type: Number, default: undefined, min: 0.1 },
   fishRarity: { type: String, enum: BUG_RARITIES, default: 'common' },
   fishActiveTime: { type: String, enum: BUG_ACTIVE_TIMES, default: 'all_day' },
   fishSpotTypes: { type: [String], default: undefined },
+  fishCollectionTags: { type: [String], default: undefined },
   lightRadius: { type: Number, default: undefined, min: 0.5 },
   lightColor: { type: String, default: undefined },
   lightIntensity: { type: Number, default: undefined, min: 0.1, max: 1 },
@@ -234,6 +314,20 @@ const gameItemDefSchema = new Schema<IGameItemDef>({
   npcDialog: { type: [npcDialogStepSchema], default: undefined },
   treeFruit: { type: String, default: undefined },
   growsOnTrees: { type: [String], default: undefined },
+  equipOverlay: {
+    type: new Schema(
+      {
+        x: { type: Number },
+        y: { type: Number },
+        flipX: { type: Boolean },
+        flipY: { type: Boolean },
+        rotationDeg: { type: Number },
+        scale: { type: Number },
+      },
+      { _id: false },
+    ),
+    default: undefined,
+  },
 });
 
 gameItemDefSchema.plugin(basePlugin);

@@ -82,12 +82,6 @@ class OpenAIService {
     }
   }
 
-  /**
-   * Sends a chat completion request and returns the assistant's reply text.
-   *
-   * @param messages — Conversation history
-   * @param opts     — Model, temperature, max tokens overrides
-   */
   async chatCompletion(messages: ChatMessage[], opts: ChatOptions = {}): Promise<string> {
     const { model = 'gpt-4.1-mini', temperature = 0.7, maxTokens = 1024 } = opts;
 

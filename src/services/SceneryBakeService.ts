@@ -51,6 +51,124 @@ interface ResolvedPlacement {
   depth: number;
   /** Rotation in degrees (0–360). Applied during composite. */
   rotationDegrees?: number;
+  /** Mirror horizontally before rotation. */
+  flipX?: boolean;
+  /** Mirror vertically before rotation. */
+  flipY?: boolean;
+  /** Hue rotation in degrees (0 = unchanged). */
+  hueDegrees?: number;
+  /** Saturation multiplier (1 = unchanged). */
+  saturation?: number;
+  /** Brightness multiplier (1 = unchanged). */
+  brightness?: number;
+  /** Contrast multiplier (1 = unchanged). */
+  contrast?: number;
+  /** Lift dark tones 0–100 (0 = unchanged). */
+  shadowLift?: number;
+  /** Pull down bright tones 0–100 (0 = unchanged). */
+  highlightCompress?: number;
+  /** Warm ↔ cool −100…100 (0 = unchanged). */
+  warmth?: number;
+  /** Opacity 0–1 (1 = opaque). */
+  opacity?: number;
+  /** Edge fade 0–100 (% of that side of the sprite). */
+  featherTop?: number;
+  featherRight?: number;
+  featherBottom?: number;
+  featherLeft?: number;
+  knockoutColor?: string;
+  knockoutTolerance?: number;
+  /** sharp.composite blend mode (default over). */
+  blendMode?: string;
+  /**
+   * Stretch the artwork to fill the box instead of fitting it inside. Only set
+   * for placements scaled unevenly, so evenly-scaled ones keep letterboxing
+   * exactly as the clients' `contain` sizing does.
+   */
+  stretch?: boolean;
+}
+
+function featherEdgeAlpha(t: number): number {
+  if (t >= 1) return 1;
+  if (t <= 1 / 3) return 0;
+  const u = (t - 1 / 3) / (2 / 3);
+  return u * u;
+}
+
+const KNOCKOUT_MAX_DIST = Math.sqrt(3 * 255 * 255);
+
+function parseHexColor(hex: string | undefined): { r: number; g: number; b: number } | null {
+  if (!hex) return null;
+  const raw = hex.trim();
+  let h = raw.startsWith('#') ? raw.slice(1) : raw;
+  if (/^[0-9a-fA-F]{3}$/.test(h)) {
+    h = `${h[0]}${h[0]}${h[1]}${h[1]}${h[2]}${h[2]}`;
+  }
+  if (/^[0-9a-fA-F]{8}$/.test(h)) h = h.slice(0, 6);
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+  const n = parseInt(h, 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+/** Pixels inside the tolerance radius are fully removed; a small fringe fades. */
+function knockoutKeep(r: number, g: number, b: number, hex: string | undefined, tolerancePct: number | undefined): number {
+  const target = parseHexColor(hex);
+  if (!target) return 1;
+  const t = Math.max(0, Math.min(100, tolerancePct ?? 22));
+  if (t <= 0) return 1;
+  const radius = t / 100;
+  const d =
+    Math.sqrt((r - target.r) ** 2 + (g - target.g) ** 2 + (b - target.b) ** 2) / KNOCKOUT_MAX_DIST;
+  if (d <= radius) return 0;
+  const fade = radius + Math.max(0.03, radius * 0.18);
+  if (d >= fade) return 1;
+  const u = (d - radius) / (fade - radius);
+  return u * u;
+}
+
+function applySpriteAlpha(
+  sprite: Buffer,
+  p: {
+    featherTop?: number;
+    featherRight?: number;
+    featherBottom?: number;
+    featherLeft?: number;
+    knockoutColor?: string;
+    knockoutTolerance?: number;
+  },
+): Promise<Buffer> {
+  const top = Math.max(0, Math.min(1, (p.featherTop ?? 0) / 100));
+  const right = Math.max(0, Math.min(1, (p.featherRight ?? 0) / 100));
+  const bottom = Math.max(0, Math.min(1, (p.featherBottom ?? 0) / 100));
+  const left = Math.max(0, Math.min(1, (p.featherLeft ?? 0) / 100));
+  const knock = parseHexColor(p.knockoutColor);
+  if (!top && !right && !bottom && !left && !knock) return Promise.resolve(sprite);
+
+  return sharp(sprite)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+    .then(({ data, info }) => {
+      const { width, height, channels } = info;
+      const leftPx = left * (width - 1);
+      const rightPx = right * (width - 1);
+      const topPx = top * (height - 1);
+      const bottomPx = bottom * (height - 1);
+      for (let y = 0; y < height; y++) {
+        let yMul = 1;
+        if (topPx > 0 && y < topPx) yMul = featherEdgeAlpha(y / topPx);
+        if (bottomPx > 0 && height - 1 - y < bottomPx) yMul *= featherEdgeAlpha((height - 1 - y) / bottomPx);
+        for (let x = 0; x < width; x++) {
+          let m = yMul;
+          if (leftPx > 0 && x < leftPx) m *= featherEdgeAlpha(x / leftPx);
+          if (rightPx > 0 && width - 1 - x < rightPx) m *= featherEdgeAlpha((width - 1 - x) / rightPx);
+          const i = (y * width + x) * channels;
+          if (knock) m *= knockoutKeep(data[i], data[i + 1], data[i + 2], p.knockoutColor, p.knockoutTolerance);
+          if (m < 1) data[i + channels - 1] = Math.round(data[i + channels - 1] * m);
+        }
+      }
+      return sharp(data, { raw: { width, height, channels } }).png().toBuffer();
+    });
 }
 
 // ─── Placement Generation ────────────────────────────────────────────────────
@@ -248,7 +366,7 @@ async function compositeToBuffer(
     }
   }
 
-  const composites: { input: Buffer; left: number; top: number }[] = [];
+  const composites: { input: Buffer; left: number; top: number; blend?: import('sharp').Blend }[] = [];
   let fetched = 0;
   let skipped = 0;
 
@@ -260,66 +378,117 @@ async function compositeToBuffer(
 
       const rawLeft = Math.round(p.left);
       const rawTop = Math.round(p.top);
-      const rot = p.rotationDegrees ?? 0;
+      // Match CSS: positive degrees = clockwise. Normalize to [0, 360).
+      const rot = ((((p.rotationDegrees ?? 0) % 360) + 360) % 360);
 
       const buf = await fetchImage(p.imageUrl);
+
+      // IMPORTANT: sharp always applies rotate *before* resize when chained on
+      // one pipeline, which breaks CSS-like "size the footprint, then rotate".
+      // Finish resize to a buffer first, then rotate in a second pipeline.
       let pipeline = sharp(buf)
         .resize(fullW, fullH, {
-          fit: 'contain',
+          fit: p.stretch ? 'fill' : 'contain',
           background: { r: 0, g: 0, b: 0, alpha: 0 },
         })
         .ensureAlpha();
-
-      if (rot !== 0) {
-        pipeline = pipeline.rotate(rot, {
-          background: { r: 0, g: 0, b: 0, alpha: 0 },
+      if (p.featherTop || p.featherRight || p.featherBottom || p.featherLeft || p.knockoutColor) {
+        const resized = await applySpriteAlpha(await pipeline.png().toBuffer(), p);
+        pipeline = sharp(resized).ensureAlpha();
+      }
+      // Mirror before rotate so flips match CSS/RN `scale then rotate`.
+      if (p.flipX) pipeline = pipeline.flop();
+      if (p.flipY) pipeline = pipeline.flip();
+      const hue = Math.round(p.hueDegrees ?? 0);
+      const sat = p.saturation ?? 1;
+      const bri = p.brightness ?? 1;
+      const contrast = p.contrast ?? 1;
+      const shadowT = Math.max(0, Math.min(100, p.shadowLift ?? 0)) / 100;
+      const highlightT = Math.max(0, Math.min(100, p.highlightCompress ?? 0)) / 100;
+      const warmthT = Math.max(-100, Math.min(100, p.warmth ?? 0)) / 100;
+      if (hue !== 0 || sat !== 1 || bri !== 1) {
+        pipeline = pipeline.modulate({
+          ...(hue !== 0 ? { hue } : {}),
+          ...(sat !== 1 ? { saturation: sat } : {}),
+          ...(bri !== 1 ? { brightness: bri } : {}),
         });
       }
+      // Contrast around mid-grey: out = c·in + 128·(1−c)
+      if (contrast !== 1) {
+        pipeline = pipeline.linear(contrast, 128 * (1 - contrast));
+      }
+      // Lift crushed blacks / dark outlines (out = a·in + b).
+      if (shadowT > 0) {
+        pipeline = pipeline.linear(1 - shadowT * 0.22, shadowT * 48);
+      }
+      // Soften hot whites / blown highlights.
+      if (highlightT > 0) {
+        pipeline = pipeline.gamma(1 + highlightT * 1.2);
+      }
+      // Warm ↔ cool via per-channel gain (alpha unchanged).
+      if (warmthT !== 0) {
+        pipeline = pipeline.linear(
+          [1 + warmthT * 0.12, 1 + warmthT * 0.03, 1 - warmthT * 0.12, 1],
+          [warmthT * 10, warmthT * 2, -warmthT * 10, 0],
+        );
+      }
+      // Fade alpha (makes the sprite partially transparent in the bake).
+      const opacity = Math.max(0, Math.min(1, p.opacity ?? 1));
+      if (opacity < 1) {
+        pipeline = pipeline.linear([1, 1, 1, opacity], [0, 0, 0, 0]);
+      }
+      let sprite = await pipeline.png().toBuffer();
 
-      const resized = await pipeline.png().toBuffer();
-
-      let compositeLeft: number;
-      let compositeTop: number;
+      let outW = fullW;
+      let outH = fullH;
+      let placeLeft = rawLeft;
+      let placeTop = rawTop;
 
       if (rot !== 0) {
-        const rad = (rot * Math.PI) / 180;
-        const cos = Math.abs(Math.cos(rad));
-        const sin = Math.abs(Math.sin(rad));
-        const rotW = Math.ceil(fullW * cos + fullH * sin);
-        const rotH = Math.ceil(fullW * sin + fullH * cos);
+        sprite = await sharp(sprite)
+          .rotate(rot, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+          .png()
+          .toBuffer();
+        const meta = await sharp(sprite).metadata();
+        outW = meta.width ?? fullW;
+        outH = meta.height ?? fullH;
+        // Pivot around the unrotated footprint center (CSS transform-origin: center).
         const centerX = rawLeft + fullW / 2;
         const centerY = rawTop + fullH / 2;
-        compositeLeft = Math.round(centerX - rotW / 2);
-        compositeTop = Math.round(centerY - rotH / 2);
-      } else {
-        const visLeft = Math.max(0, rawLeft);
-        const visTop = Math.max(0, rawTop);
-        const visRight = Math.min(widthPx, rawLeft + fullW);
-        const visBottom = Math.min(heightPx, rawTop + fullH);
-        const visW = visRight - visLeft;
-        const visH = visBottom - visTop;
-        if (visW <= 0 || visH <= 0) { skipped++; continue; }
-
-        const needsCrop = visW < fullW || visH < fullH;
-        if (needsCrop) {
-          const cropped = await sharp(resized)
-            .extract({
-              left: visLeft - rawLeft,
-              top: visTop - rawTop,
-              width: visW,
-              height: visH,
-            })
-            .png()
-            .toBuffer();
-          composites.push({ input: cropped, left: visLeft, top: visTop });
-        } else {
-          composites.push({ input: resized, left: visLeft, top: visTop });
-        }
-        fetched++;
-        continue;
+        placeLeft = Math.round(centerX - outW / 2);
+        placeTop = Math.round(centerY - outH / 2);
       }
 
-      composites.push({ input: resized, left: compositeLeft, top: compositeTop });
+      // Clip to the bake canvas — sharp.composite rejects negative left/top.
+      const visLeft = Math.max(0, placeLeft);
+      const visTop = Math.max(0, placeTop);
+      const visRight = Math.min(widthPx, placeLeft + outW);
+      const visBottom = Math.min(heightPx, placeTop + outH);
+      const visW = visRight - visLeft;
+      const visH = visBottom - visTop;
+      if (visW <= 0 || visH <= 0) { skipped++; continue; }
+
+      if (visW < outW || visH < outH) {
+        sprite = await sharp(sprite)
+          .extract({
+            left: visLeft - placeLeft,
+            top: visTop - placeTop,
+            width: visW,
+            height: visH,
+          })
+          .png()
+          .toBuffer();
+      }
+
+      const entry: { input: Buffer; left: number; top: number; blend?: import('sharp').Blend } = {
+        input: sprite,
+        left: visLeft,
+        top: visTop,
+      };
+      if (p.blendMode && p.blendMode !== 'over') {
+        entry.blend = p.blendMode as import('sharp').Blend;
+      }
+      composites.push(entry);
       fetched++;
     } catch (err) {
       skipped++;
@@ -445,16 +614,27 @@ export const sceneryBakeService = {
         const tileH = 5 * TILE_SIZE * BAKE_SCALE;
         const tileCols = Math.ceil(scene.cols / 5);
         const tileRows = Math.ceil(scene.rows / 5);
+        const style = scene.tiledFlooringStyle;
         for (let row = 0; row < tileRows; row++) {
           for (let col = 0; col < tileCols; col++) {
-            resolved.push({
+            const r: ResolvedPlacement = {
               left: col * tileW,
               top: row * tileH,
               width: tileW,
               height: tileH,
               imageUrl: tileDef.imageUrl,
               depth: -1e7,
-            });
+            };
+            if (style?.hueDegrees) r.hueDegrees = style.hueDegrees;
+            if (style?.saturation != null && style.saturation !== 1) r.saturation = style.saturation;
+            if (style?.brightness != null && style.brightness !== 1) r.brightness = style.brightness;
+            if (style?.contrast != null && style.contrast !== 1) r.contrast = style.contrast;
+            if (style?.shadowLift) r.shadowLift = style.shadowLift;
+            if (style?.highlightCompress) r.highlightCompress = style.highlightCompress;
+            if (style?.warmth) r.warmth = style.warmth;
+            if (style?.opacity != null && style.opacity !== 1) r.opacity = style.opacity;
+            if (style?.blendMode && style.blendMode !== 'over') r.blendMode = style.blendMode;
+            resolved.push(r);
           }
         }
       }
@@ -462,14 +642,17 @@ export const sceneryBakeService = {
 
     resolved.push(
       ...scene.placements
+      // Live placements are drawn at runtime so pets can walk behind them.
+      .filter((p) => !p.live)
       .map((p) => {
         const def = itemDefs[p.itemType];
         if (!def?.imageUrl) return null;
-        const s = p.scale;
         const baseW = TILE_SIZE * (def.cols ?? 1);
         const baseH = TILE_SIZE * (def.rows ?? 1);
-        const w = baseW * s;
-        const h = baseH * s;
+        const sx = p.scaleX ?? p.scale;
+        const sy = p.scaleY ?? p.scale;
+        const w = baseW * sx;
+        const h = baseH * sy;
         const baseDepth = (p.y + baseH) / TILE_SIZE;
         const cat = def.category;
         let depth = baseDepth;
@@ -485,6 +668,24 @@ export const sceneryBakeService = {
           depth,
         };
         if (p.rotationDegrees != null) r.rotationDegrees = p.rotationDegrees;
+        if (p.flipX) r.flipX = true;
+        if (p.flipY) r.flipY = true;
+        if (p.hueDegrees) r.hueDegrees = p.hueDegrees;
+        if (p.saturation != null && p.saturation !== 1) r.saturation = p.saturation;
+        if (p.brightness != null && p.brightness !== 1) r.brightness = p.brightness;
+        if (p.contrast != null && p.contrast !== 1) r.contrast = p.contrast;
+        if (p.shadowLift) r.shadowLift = p.shadowLift;
+        if (p.highlightCompress) r.highlightCompress = p.highlightCompress;
+        if (p.warmth) r.warmth = p.warmth;
+        if (p.opacity != null && p.opacity !== 1) r.opacity = p.opacity;
+        if (p.featherTop) r.featherTop = p.featherTop;
+        if (p.featherRight) r.featherRight = p.featherRight;
+        if (p.featherBottom) r.featherBottom = p.featherBottom;
+        if (p.featherLeft) r.featherLeft = p.featherLeft;
+        if (p.knockoutColor) r.knockoutColor = p.knockoutColor;
+        if (p.knockoutColor && p.knockoutTolerance != null) r.knockoutTolerance = p.knockoutTolerance;
+        if (p.blendMode && p.blendMode !== 'over') r.blendMode = p.blendMode;
+        if (sx !== sy) r.stretch = true;
         return r;
       })
       .filter((r): r is ResolvedPlacement => r !== null),

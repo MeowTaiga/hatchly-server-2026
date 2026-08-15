@@ -6,7 +6,7 @@ export interface IRecipeIngredient {
   qty: number;
 }
 
-export type RecipeType = 'cooking' | 'crafting';
+export type RecipeType = 'cooking' | 'crafting' | 'smelting';
 
 export interface IRecipe extends Document {
   recipeId: string;
@@ -18,6 +18,12 @@ export interface IRecipe extends Document {
   difficulty: number;
   /** Distinguishes cooking recipes from crafting recipes. */
   recipeType: RecipeType;
+  /**
+   * Inventory item that unlocks this recipe (e.g. recipe_wood_plank / recipe_bread).
+   */
+  recipeItemType?: string;
+  /** Cooking UI tab group: processing | baking | sandwich | bakery | salad | soup | dessert | drink */
+  group?: string;
   sortOrder: number;
   createdAt: Date;
   updatedAt: Date;
@@ -38,7 +44,9 @@ const recipeSchema = new Schema<IRecipe>({
   resultQty: { type: Number, required: true, default: 1, min: 1 },
   ingredients: { type: [recipeIngredientSchema], required: true, validate: [(v: any[]) => v.length >= 1 && v.length <= 4, 'Recipes must have 1-4 ingredients'] },
   difficulty: { type: Number, required: true, default: 1, min: 1, max: 5 },
-  recipeType: { type: String, enum: ['cooking', 'crafting'], default: 'cooking' },
+  recipeType: { type: String, enum: ['cooking', 'crafting', 'smelting'], default: 'cooking' },
+  recipeItemType: { type: String, default: undefined },
+  group: { type: String, default: undefined },
   sortOrder: { type: Number, default: 0 },
 });
 

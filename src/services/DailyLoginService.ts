@@ -1,8 +1,13 @@
 import { type IPlacedItem } from '../models/Farm.js';
-import { GameItemDef } from '../models/GameItemDef.js';
 import { DailyLoginReward } from '../models/DailyLoginReward.js';
 import { User } from '../models/User.js';
 import { farmService } from './FarmService.js';
+import {
+  appendFossilHoles,
+  DAILY_FOSSIL_HOLE_COUNT,
+  FOSSIL_HOLE_ITEM_TYPE,
+  spawnDailyGroundPickupsForUser,
+} from './GroundPickupService.js';
 import { advanceTreeGrowth } from './TreeService.js';
 import { getTodayDateStr, getYesterdaySummary } from '../utils/getYesterdaySummary.js';
 import { getDailyGreeting } from './PetGreetingService.js';
@@ -11,52 +16,28 @@ import { createLogger } from '../config/logger.js';
 
 const log = createLogger('DailyLoginService');
 
-const FOSSIL_HOLE_COUNT = 2;
-
-/**
- * Finds empty grid slots for fossil placement. Prefers interior tiles (excludes edges);
- * falls back to any empty tile if no interior slots exist. Returns up to `count`
- * slots chosen randomly. Marks ALL tiles occupied by multi-tile items (not just anchor).
- */
-function findEmptyGridSlots(placedItems: IPlacedItem[], gridCols: number, gridRows: number, count: number): { col: number; row: number }[] {
-  const occupied = new Set<string>();
-  for (const item of placedItems) {
-    const cols = item.tileCols ?? 1;
-    const rows = item.tileRows ?? 1;
-    for (let dr = 0; dr < rows; dr++) {
-      for (let dc = 0; dc < cols; dc++) {
-        occupied.add(`${item.col + dc}:${item.row + dr}`);
-      }
-    }
+function dateStrInTz(date: Date, timezone?: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(date);
+  } catch {
+    return date.toISOString().slice(0, 10);
   }
+}
 
-  const isEdge = (col: number, row: number) =>
-    col === 0 || col === gridCols - 1 || row === 0 || row === gridRows - 1;
-
-  const interior: { col: number; row: number }[] = [];
-  const allEmpty: { col: number; row: number }[] = [];
-
-  for (let row = 0; row < gridRows; row++) {
-    for (let col = 0; col < gridCols; col++) {
-      if (occupied.has(`${col}:${row}`)) continue;
-      allEmpty.push({ col, row });
-      if (!isEdge(col, row)) interior.push({ col, row });
-    }
-  }
-
-  const candidates = interior.length >= count ? interior : allEmpty;
-
-  // Fisher–Yates shuffle, then take first `count`
-  for (let i = candidates.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-  }
-  return candidates.slice(0, count);
+function countUndugFossilHoles(placedItems: readonly IPlacedItem[]): number {
+  return placedItems.filter(
+    (i) => i.itemType === FOSSIL_HOLE_ITEM_TYPE && !i.anchorId,
+  ).length;
 }
 
 /**
- * Checks if user has already received today's rewards. If not, places 2 fossil_holes on farm,
- * generates AI greeting from yesterday's data, records the reward, and returns the greeting.
+ * Checks if user has already received today's rewards. If not, places fossil holes +
+ * daily ground pickups (stones/sticks), generates AI greeting, records the reward.
  */
 export async function checkAndGrant(userId: string, timezone?: string): Promise<{ greeting?: string }> {
   const today = getTodayDateStr(timezone);
@@ -69,30 +50,37 @@ export async function checkAndGrant(userId: string, timezone?: string): Promise<
   const user = await User.findById(userId).lean();
   if (!user) return {};
 
+  // Ensure farm exists (create path seeds stones/sticks + dig spots for day 0).
   const farm = await farmService.loadOrCreateFarm(userId);
-  const fossilDef = await GameItemDef.findOne({ itemType: 'fossil_hole' }).lean();
-  if (!fossilDef || !fossilDef.placeable) {
-    log.warn({ userId }, 'fossil_hole not found or not placeable, skipping daily reward');
-    return {};
+  const createdToday = dateStrInTz(farm.createdAt, timezone) === today;
+
+  // Day-0 farms already got dig spots in loadOrCreateFarm. Returning players get
+  // a fresh pair each calendar day. Skip on create-day so reset/new farms don't
+  // end up with four holes when daily-login also fires.
+  if (!createdToday) {
+    const undugBefore = countUndugFossilHoles(farm.placedItems);
+    const { gridCols, gridRows } = await farmService.getGridDimensions(userId);
+    const { items, placed } = await appendFossilHoles(
+      farm.placedItems,
+      gridCols,
+      gridRows,
+      DAILY_FOSSIL_HOLE_COUNT,
+    );
+    if (placed > 0) {
+      farm.placedItems = items;
+      farm.markModified('placedItems');
+      await farm.save();
+    }
+    log.info({ userId, placed, undugBefore }, 'Daily fossil holes placed');
+  } else {
+    log.info({ userId }, 'Skipping daily fossil holes — day-0 farm already seeded dig spots');
   }
 
-  const { gridCols, gridRows } = await farmService.getGridDimensions(userId);
-  const slots = findEmptyGridSlots(farm.placedItems, gridCols, gridRows, FOSSIL_HOLE_COUNT);
-  if (slots.length === 0) {
-    log.info({ userId }, 'No empty slots for fossil holes, skipping placement');
-  } else {
-    const currentQty = farm.inventory.get('fossil_hole') ?? 0;
-    farm.inventory.set('fossil_hole', currentQty + FOSSIL_HOLE_COUNT);
-    farm.markModified('inventory');
-    await farm.save();
-
-    for (const slot of slots) {
-      try {
-        await farmService.placeItem(userId, 'fossil_hole', slot.col, slot.row);
-      } catch (err) {
-        log.warn({ userId, slot, err }, 'Failed to place fossil_hole');
-      }
-    }
+  try {
+    // Refresh stones/sticks to today's counts (clears leftovers, then re-places).
+    await spawnDailyGroundPickupsForUser(userId);
+  } catch (err) {
+    log.warn({ userId, err }, 'Failed to spawn daily ground pickups');
   }
 
   const yesterdaySummary = await getYesterdaySummary(userId, timezone);

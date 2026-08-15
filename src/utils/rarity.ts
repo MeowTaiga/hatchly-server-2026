@@ -23,6 +23,15 @@ export const RARITY_TO_DIFFICULTY: Record<BugRarity, number> = {
   mythic: 5,
 };
 
+/** Craft difficulty (1-5) → loot rarity. Harder crafts drop less often. */
+export const DIFFICULTY_TO_LOOT_RARITY: Record<1 | 2 | 3 | 4 | 5, BugRarity> = {
+  1: 'common',
+  2: 'rare',
+  3: 'epic',
+  4: 'unique',
+  5: 'legendary',
+};
+
 /** Gem multiplier applied on catch/reward per rarity. */
 export const RARITY_GEM_MULTIPLIER: Record<BugRarity, number> = {
   common: 1,

@@ -9,8 +9,11 @@ import { GameItemDef, type IGameItemDef } from '../models/GameItemDef.js';
 import { farmService, type StateUpdate, type PlacedItemSnapshot } from './FarmService.js';
 import { getTodayDateStr } from '../utils/getYesterdaySummary.js';
 import { createLogger } from '../config/logger.js';
-import { questService } from './QuestService.js';
-import { resolveFarmLevel } from './FarmService.js';
+import { questService } from './quests/index.js';
+import { withQuestSync } from './FarmService.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import { attachSkillXp, skillXpService } from './SkillXpService.js';
+import { addToBackpack } from './inventoryCapacity.js';
 
 const log = createLogger('TreeService');
 
@@ -116,6 +119,36 @@ export async function ensureCompoundTreeDefs(
       log.info({ compoundItemType }, 'Compound tree def ensured');
     }
   }
+}
+
+const TREE_STAGE_PREFIXES = ['tree_sappling_', 'tree_in_growth_', 'tree_fully_grown_'] as const;
+
+/**
+ * Copy sapling / in-growth / fully-grown art from one tree variant onto another
+ * when the target has no imageUrl (e.g. oak_plain and dark_oak reuse oak sprites).
+ */
+export async function copyTreeVariantArt(fromVariant: string, toVariant: string): Promise<number> {
+  if (fromVariant === toVariant) return 0;
+  let copied = 0;
+  for (const prefix of TREE_STAGE_PREFIXES) {
+    const source = await GameItemDef.findOne({ itemType: `${prefix}${fromVariant}` })
+      .select('imageUrl')
+      .lean();
+    const imageUrl = source?.imageUrl?.trim();
+    if (!imageUrl) continue;
+    const result = await GameItemDef.updateMany(
+      {
+        itemType: { $regex: `^${prefix}${toVariant}(_|$)` },
+        $or: [{ imageUrl: { $exists: false } }, { imageUrl: null }, { imageUrl: '' }],
+      },
+      { $set: { imageUrl } },
+    );
+    copied += result.modifiedCount;
+  }
+  if (copied > 0) {
+    log.info({ fromVariant, toVariant, copied }, 'Copied tree variant art');
+  }
+  return copied;
 }
 
 /**
@@ -297,39 +330,9 @@ export async function advanceTreeGrowth(userId: string, timezone?: string): Prom
       continue;
     }
 
-    if (targetStage === currentStage) {
-      // Check fruit for fully grown fruit trees
-      if (targetStage === 'fully_grown') {
-        const def = itemDefs[item.itemType] as IGameItemDef | undefined;
-        const fruitLastHarvested = item.fruitLastHarvestedDate;
-        const fruitCount = item.treeFruitCount ?? 0;
-        if (def?.treeFruit) {
-          const anchId = item.anchorId ?? item.id;
-          const toUpdate = farm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
-          // Backfill: tree never harvested (no fruitLastHarvestedDate) and no fruit → set 3 fruit
-          if (!fruitLastHarvested && fruitCount < MAX_FRUIT_COUNT) {
-            for (const t of toUpdate) {
-              if (!t.anchorId) {
-                (t as { treeFruitCount?: number }).treeFruitCount = MAX_FRUIT_COUNT;
-              }
-            }
-            modified = true;
-          } else if (fruitLastHarvested && fruitCount < MAX_FRUIT_COUNT) {
-            const daysSinceHarvest = daysBetween(fruitLastHarvested, today);
-            if (daysSinceHarvest >= FRUIT_REGROW_DAYS) {
-              for (const t of toUpdate) {
-                if (!t.anchorId) {
-                  (t as { treeFruitCount?: number }).treeFruitCount = MAX_FRUIT_COUNT;
-                  (t as { fruitLastHarvestedDate?: string }).fruitLastHarvestedDate = undefined;
-                }
-              }
-              modified = true;
-            }
-          }
-        }
-      }
-      continue;
-    }
+    // Already at the right stage. Fruit is handled by the fully_grown branch
+    // above, and a sapling or growing tree has none.
+    if (targetStage === currentStage) continue;
 
     const nextItemType = getTreeItemType(targetStage, variant);
     const nextDef = itemDefs[nextItemType];
@@ -399,13 +402,16 @@ export async function shakeTree(userId: string, anchorId: string): Promise<{
   const fruitCount = anchorItem.treeFruitCount ?? 0;
   const treeCol = anchorItem.col;
   const treeRow = anchorItem.row;
+  const shakeEvent = { kind: 'action' as const, action: 'shake_tree', itemType: target.itemType };
 
-  // Only fully grown trees can be harvested; saplings and in_growth give nothing
+  // Saplings and growing trees still count as a shake for quests — the player
+  // tapped the tree. Fruit/sticks only drop from fully grown trees.
   if (!isFullyGrown) {
+    const sync = await questService.recordEvents(userId, shakeEvent);
     const treeItems = farm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
     return {
       result: { drops: [], anchorId: anchId },
-      stateUpdate: { addedItems: treeItems.map(toPlacedSnapshot) },
+      stateUpdate: withQuestSync({ addedItems: treeItems.map(toPlacedSnapshot) }, sync),
     };
   }
 
@@ -438,49 +444,128 @@ export async function shakeTree(userId: string, anchorId: string): Promise<{
 
   if (drops.length === 0) {
     log.info({ userId, anchorId }, 'Tree shaken but nothing to drop');
+    const sync = await questService.recordEvents(userId, shakeEvent);
     const treeItems = farm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
     return {
       result: { drops: [], anchorId: anchId },
-      stateUpdate: {
-        addedItems: treeItems.map(toPlacedSnapshot),
-      },
+      stateUpdate: withQuestSync({ addedItems: treeItems.map(toPlacedSnapshot) }, sync),
     };
   }
 
   farm.markModified('placedItems');
   await farm.save();
 
-  await questService.trackAction(userId, 'shake_tree', target.itemType);
-  const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-  const freshFarm = autoCompleted.length > 0 ? await farmService.loadOrCreateFarm(userId) : farm;
-  const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-  const quests = await questService.getQuestsForUser(userId);
+  const sync = await questService.recordEvents(userId, shakeEvent);
+  const skillGrant = await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_tree_shake);
 
-  const treeItems = freshFarm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
+  const treeItems = farm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
   const fruitDef = drops.length ? itemDefs[drops[0].itemType] : null;
-  const stateUpdate: StateUpdate = {
-    farmXp: freshFarm.xp,
-    gems: freshFarm.gems,
-    inventory: inventoryToRecord(freshFarm.inventory),
-    addedItems: treeItems.map(toPlacedSnapshot),
-    quests,
-    farmLevel: lvl.level,
-    canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-    autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-    shakeResult: {
-      drops,
-      col: treeCol,
-      row: treeRow,
-      tileCols: anchorItem.tileCols,
-      tileRows: anchorItem.tileRows,
-      cropEmoji: fruitDef?.emoji,
-      cropImageUrl: fruitDef?.imageUrl,
-    },
-  };
+  const stateUpdate = attachSkillXp(
+    withQuestSync({
+      farmXp: farm.xp,
+      gems: farm.gems,
+      inventory: inventoryToRecord(farm.inventory),
+      addedItems: treeItems.map(toPlacedSnapshot),
+      shakeResult: {
+        drops,
+        col: treeCol,
+        row: treeRow,
+        tileCols: anchorItem.tileCols,
+        tileRows: anchorItem.tileRows,
+        cropEmoji: fruitDef?.emoji,
+        cropImageUrl: fruitDef?.imageUrl,
+      },
+    }, sync),
+    skillGrant,
+  );
 
   log.info({ userId, anchorId, drops }, 'Tree shaken');
   return {
     result: { drops, anchorId: anchId },
     stateUpdate,
   };
+}
+
+const WOOD_ITEM = 'wood';
+const MAX_WOOD_CHOPS_PER_DAY = 3;
+const AXE_SUBS = new Set(['axe', 'axes']);
+
+function isAxeEquipped(
+  handTool: string | undefined,
+  itemDefs: Record<string, IGameItemDef>,
+): boolean {
+  if (!handTool) return false;
+  const sub = itemDefs[handTool]?.subCategory;
+  return !!sub && AXE_SUBS.has(sub);
+}
+
+/**
+ * Chop a tree on the player's own farm with an equipped axe.
+ * 1 wood per tap, 3 taps per tree per calendar day. Server-authoritative.
+ */
+export async function chopTree(userId: string, anchorId: string): Promise<{
+  result: ShakeTreeResult;
+  stateUpdate: StateUpdate;
+}> {
+  const farm = await farmService.loadOrCreateFarm(userId);
+  const itemDefsMap = await GameItemDef.find().lean();
+  const itemDefs = Object.fromEntries(itemDefsMap.map((d) => [d.itemType, d]));
+
+  if (!isAxeEquipped(farm.equipped?.handTool, itemDefs)) {
+    throw new Error('Equip an axe to chop wood.');
+  }
+
+  const target = farm.placedItems.find((i) => i.id === anchorId || i.anchorId === anchorId);
+  if (!target) throw new Error('Tree not found');
+
+  const def = itemDefs[target.itemType];
+  if (def?.category !== 'tree') throw new Error('That is not a tree');
+
+  const anchId = target.anchorId ?? target.id;
+  const anchorItem = farm.placedItems.find((i) => (i.anchorId ?? i.id) === anchId && !i.anchorId) ?? target;
+
+  const today = getTodayDateStr();
+  const chopDate = anchorItem.woodChopDate;
+  const usedToday = chopDate === today ? (anchorItem.woodChopCount ?? 0) : 0;
+  if (usedToday >= MAX_WOOD_CHOPS_PER_DAY) {
+    throw new Error("This tree's given all the wood it can today.");
+  }
+
+  addToBackpack(farm, WOOD_ITEM, 1);
+  (anchorItem as { woodChopDate?: string }).woodChopDate = today;
+  (anchorItem as { woodChopCount?: number }).woodChopCount = usedToday + 1;
+  farm.markModified('placedItems');
+  await farm.save();
+
+  const woodDef = itemDefs[WOOD_ITEM];
+  const drops = [{ itemType: WOOD_ITEM, qty: 1 }];
+  const sync = await questService.recordEvents(userId, {
+    kind: 'action',
+    action: 'chop_tree',
+    itemType: target.itemType,
+  });
+  const skillGrant = await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_tree_chop);
+
+  const treeItems = farm.placedItems.filter((i) => (i.anchorId ?? i.id) === anchId);
+  const stateUpdate = attachSkillXp(
+    withQuestSync({
+      farmXp: farm.xp,
+      gems: farm.gems,
+      inventory: inventoryToRecord(farm.inventory),
+      addedItems: treeItems.map(toPlacedSnapshot),
+      shakeResult: {
+        drops,
+        col: anchorItem.col,
+        row: anchorItem.row,
+        tileCols: anchorItem.tileCols,
+        tileRows: anchorItem.tileRows,
+        cropEmoji: woodDef?.emoji,
+        cropImageUrl: woodDef?.imageUrl,
+      },
+    }, sync),
+    skillGrant,
+  );
+
+  log.info({ userId, anchorId: anchId, chops: usedToday + 1 }, 'Tree chopped');
+  return { result: { drops, anchorId: anchId }, stateUpdate };
 }

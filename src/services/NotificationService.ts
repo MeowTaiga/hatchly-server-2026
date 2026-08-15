@@ -13,6 +13,17 @@ export interface CreateNotificationPayload {
   friendRequestId?: string;
   fromUserId?: string;
   fromUsername?: string;
+  goalHours?: number;
+  sessionId?: string;
+  goalId?: string;
+  goalTitle?: string;
+  marriageId?: string;
+  rewardItemType?: string;
+  rewardItemLabel?: string;
+  rewardImageUrl?: string;
+  rewardEmoji?: string;
+  rewardQty?: number;
+  xpGained?: number;
 }
 
 /** API response shape for a single notification */
@@ -43,6 +54,51 @@ function toTitleBody(type: NotificationType, payload: CreateNotificationPayload)
       return {
         title: 'Friend request accepted',
         body: `${payload.fromUsername ?? 'Someone'} accepted your friend request`,
+      };
+    case 'fasting_complete':
+      return {
+        title: 'Fast complete',
+        body: payload.goalHours
+          ? `You made it ${payload.goalHours} hours. Time to eat.`
+          : 'Your fasting timer is done. Time to eat.',
+      };
+    case 'goal_reminder':
+      return {
+        title: payload.goalTitle ?? 'Goal reminder',
+        body: payload.goalTitle
+          ? `Time to check off “${payload.goalTitle}”.`
+          : 'One of your goals is waiting.',
+      };
+    case 'marriage_proposal':
+      return {
+        title: 'A little proposal',
+        body: `${payload.fromUsername ?? 'Someone'} wants to marry you and share goals`,
+      };
+    case 'marriage_accepted':
+      return {
+        title: 'You’re married!',
+        body: `${payload.fromUsername ?? 'Someone'} said yes — you can share goals now`,
+      };
+    case 'shared_goal_complete': {
+      const who = payload.fromUsername ?? 'Your partner';
+      const goalBit = payload.goalTitle ? `“${payload.goalTitle}”` : 'a shared goal';
+      if (payload.rewardItemLabel) {
+        return {
+          title: 'Together treat',
+          body: `${who} checked off ${goalBit}. You got ${payload.rewardItemLabel}!`,
+        };
+      }
+      return {
+        title: 'Shared goal done',
+        body: `${who} checked off ${goalBit}.`,
+      };
+    }
+    case 'shared_goal_added':
+      return {
+        title: 'New Together goal',
+        body: payload.goalTitle
+          ? `${payload.fromUsername ?? 'Your partner'} shared “${payload.goalTitle}” with you.`
+          : `${payload.fromUsername ?? 'Your partner'} shared a goal with you.`,
       };
     default:
       return { title: 'Notification', body: '' };
@@ -77,6 +133,17 @@ class NotificationService {
     const data: Record<string, unknown> = {};
     if (payload.friendRequestId) data.friendRequestId = payload.friendRequestId;
     if (payload.fromUserId) data.fromUserId = payload.fromUserId;
+    if (payload.sessionId) data.sessionId = payload.sessionId;
+    if (payload.goalHours != null) data.goalHours = payload.goalHours;
+    if (payload.goalId) data.goalId = payload.goalId;
+    if (payload.goalTitle) data.goalTitle = payload.goalTitle;
+    if (payload.marriageId) data.marriageId = payload.marriageId;
+    if (payload.rewardItemType) data.rewardItemType = payload.rewardItemType;
+    if (payload.rewardItemLabel) data.rewardItemLabel = payload.rewardItemLabel;
+    if (payload.rewardImageUrl) data.rewardImageUrl = payload.rewardImageUrl;
+    if (payload.rewardEmoji) data.rewardEmoji = payload.rewardEmoji;
+    if (payload.rewardQty != null) data.rewardQty = payload.rewardQty;
+    if (payload.xpGained != null) data.xpGained = payload.xpGained;
 
     const doc = await Notification.create({
       userId: new mongoose.Types.ObjectId(userId),

@@ -2,12 +2,50 @@ import crypto from 'crypto';
 import { Farm } from '../models/Farm.js';
 import { GameItemDef, type IGameItemDef, type BugRarity, type BugActiveTime } from '../models/GameItemDef.js';
 import { UserCollection } from '../models/UserCollection.js';
-import { farmService } from './FarmService.js';
-import { questService } from './QuestService.js';
+import { farmService, withQuestSync } from './FarmService.js';
+import { questService } from './quests/index.js';
+import { weatherService } from './WeatherService.js';
 import { createLogger } from '../config/logger.js';
 import { RARITY_WEIGHTS, RARITY_GEM_MULTIPLIER } from '../utils/rarity.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import { attachSkillXp, skillXpService } from './SkillXpService.js';
 
 const log = createLogger('BugService');
+
+/**
+ * Coarse habitat keys (museum / seed) → placed-item host used for spawn.
+ * `null` means the bug wanders anywhere (no host required).
+ */
+const HABITAT_TO_HOST: Record<string, string | null> = {
+  flower: 'flower',
+  forest: 'tree',
+  grass: 'crop',
+  rock: 'rock',
+  haunt: 'light_source',
+  pond: null,
+  open: null,
+  // Legacy admin keys (pass through)
+  crop: 'crop',
+  tree: 'tree',
+  light_source: 'light_source',
+};
+
+/** Resolve bugSpawnOn habitats into host subcategories (or anywhere). */
+function resolveSpawnHosts(bugSpawnOn: string[]): { anywhere: boolean; hosts: string[] } {
+  const hosts = new Set<string>();
+  let anywhere = false;
+  for (const raw of bugSpawnOn) {
+    if (raw in HABITAT_TO_HOST) {
+      const mapped = HABITAT_TO_HOST[raw];
+      if (mapped == null) anywhere = true;
+      else hosts.add(mapped);
+    } else {
+      hosts.add(raw);
+    }
+  }
+  if (anywhere && hosts.size === 0) return { anywhere: true, hosts: [] };
+  return { anywhere: hosts.size === 0, hosts: [...hosts] };
+}
 
 /** How long a bug stays on the map before it despawns (ms). */
 export const BUG_LIFESPAN_MS = 60_000;
@@ -192,11 +230,14 @@ export const bugService = {
     const allBugDefs = await GameItemDef.find({ category: 'bug' }).lean();
     if (allBugDefs.length === 0) return null;
 
-    // Filter to bugs active during the user's current time period and scene
+    // Filter to bugs active during the user's current time period, scene, and weather
     const period = getCurrentTimePeriod(timezone);
+    const weatherType = weatherService.getActiveWeather().type;
     const eligible = allBugDefs.filter((d) => {
       const activeTime = ((d as any).bugActiveTime as BugActiveTime) || 'all_day';
       if (activeTime !== 'all_day' && activeTime !== period) return false;
+      const weatherReq = (d as any).bugWeather as string | undefined;
+      if (weatherReq === 'rain' && weatherType !== 'rain') return false;
       const scenes = (d as any).bugScenes as string[] | undefined;
       if (!scenes?.length) return true;
       return scenes.includes(sceneSlug);
@@ -209,7 +250,9 @@ export const bugService = {
     let row: number;
     let hostPlacedItemId: string | undefined;
 
-    if (bugSpawnOn?.length) {
+    const resolved = bugSpawnOn?.length ? resolveSpawnHosts(bugSpawnOn) : { anywhere: true, hosts: [] as string[] };
+
+    if (!resolved.anywhere && resolved.hosts.length > 0) {
       const [farm, { gridCols, gridRows }] = await Promise.all([
         Farm.findOne({ userId }).lean(),
         farmService.getGridDimensions(userId),
@@ -220,7 +263,7 @@ export const bugService = {
       const itemDefs = await GameItemDef.find().lean();
       const itemDefsMap: Record<string, IGameItemDef> = {};
       for (const d of itemDefs) itemDefsMap[d.itemType] = d as IGameItemDef;
-      const tiles = getEligibleSpawnTiles(farm.placedItems, itemDefsMap, bugSpawnOn, gridCols, gridRows);
+      const tiles = getEligibleSpawnTiles(farm.placedItems, itemDefsMap, resolved.hosts, gridCols, gridRows);
       if (tiles.length === 0) return null;
       const picked = tiles[Math.floor(Math.random() * tiles.length)];
       col = picked.col;
@@ -251,13 +294,25 @@ export const bugService = {
   },
 
   /**
-   * Process a bug catch. Rolls size via bell curve, awards gems, saves to collection.
+   * Process a bug catch. Requires an equipped net (subCategory net / bug_net).
+   * Rolls size via bell curve, awards gems, saves to collection.
    * Returns the catch result, or null if the spawn ID is invalid/expired.
    */
   async catchBug(userId: string, spawnId: string): Promise<{ catchResult: CatchResult; stateUpdate: Record<string, any> } | null> {
     const bugs = getActiveBugs(userId);
     const idx = bugs.findIndex((b) => b.spawnId === spawnId);
     if (idx < 0) return null;
+
+    const farm = await Farm.findOne({ userId });
+    const handTool = farm?.equipped?.handTool;
+    if (!handTool) {
+      throw new Error('You need a bug net equipped!');
+    }
+    const toolDef = await GameItemDef.findOne({ itemType: handTool }).lean();
+    const sub = toolDef?.subCategory;
+    if (sub !== 'net' && sub !== 'bug_net' && sub !== 'bug_nets') {
+      throw new Error('You need a bug net equipped!');
+    }
 
     const bug = bugs[idx];
     bugs.splice(idx, 1);
@@ -281,7 +336,6 @@ export const bugService = {
     });
 
     // Update farm: add bug to inventory
-    const farm = await Farm.findOne({ userId });
     if (farm) {
       const current = farm.inventory.get(bug.itemType) ?? 0;
       farm.inventory.set(bug.itemType, current + 1);
@@ -291,13 +345,8 @@ export const bugService = {
 
     log.info({ userId, spawnId, itemType: bug.itemType, size, gemsAwarded, sizeLabel, rarity }, 'Bug caught');
 
-    // Track quest action for catching bugs + always refresh quests
-    await questService.trackAction(userId, 'catch', bug.itemType);
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-
-    // Re-read farm if quests auto-completed (rewards may have changed gems/inventory)
-    const freshFarm = autoCompleted.length > 0 ? await Farm.findOne({ userId }) : farm;
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'catch', itemType: bug.itemType });
+    const skillGrant = await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.bug_catch);
 
     const catchResult: CatchResult = {
       spawnId,
@@ -310,20 +359,21 @@ export const bugService = {
     };
 
     const inventoryRecord: Record<string, number> = {};
-    if (freshFarm) {
-      for (const [k, v] of freshFarm.inventory) {
+    if (farm) {
+      for (const [k, v] of farm.inventory) {
         if (v > 0) inventoryRecord[k] = v;
       }
     }
 
     return {
       catchResult,
-      stateUpdate: {
-        gems: freshFarm?.gems ?? 0,
-        inventory: inventoryRecord,
-        quests,
-        autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-      },
+      stateUpdate: attachSkillXp(
+        withQuestSync({
+          gems: farm?.gems ?? 0,
+          inventory: inventoryRecord,
+        }, sync),
+        skillGrant,
+      ),
     };
   },
 

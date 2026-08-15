@@ -6,9 +6,19 @@ import { User } from '../models/User.js';
 import { Farm } from '../models/Farm.js';
 import { createLogger } from '../config/logger.js';
 import { fishService } from '../services/FishService.js';
-import { questService } from '../services/QuestService.js';
+import { assertCanEnterScene } from '../services/SceneAccessService.js';
+import { tradeService, type TradeOfferItem } from '../services/TradeService.js';
 
 const log = createLogger('MultiplayerWS');
+
+function emitTradeSnapshots(tradeId: string): void {
+  const session = tradeService.getSession(tradeId);
+  if (!session) return;
+  for (const uid of [session.initiatorUserId, session.recipientUserId]) {
+    const snap = tradeService.snapshotFor(tradeId, uid);
+    if (snap) emitToUser(uid, WS_EVENTS.MP_TRADE_STATE, snap);
+  }
+}
 
 const MOVE_THROTTLE_MS = 66; // ~15 updates/sec max
 const CHAT_MAX_LENGTH = 200;
@@ -22,6 +32,13 @@ export function registerMultiplayerHandlers(socket: AuthenticatedSocket): void {
       const sceneSlug = data?.sceneSlug;
       if (!sceneSlug || typeof sceneSlug !== 'string') {
         socket.emit(WS_EVENTS.GAME_ERROR, { message: 'Invalid scene slug' });
+        return;
+      }
+
+      try {
+        await assertCanEnterScene(userId, sceneSlug);
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.GAME_ERROR, { message: err.message ?? 'Cannot enter that scene yet' });
         return;
       }
 
@@ -185,25 +202,8 @@ export function registerMultiplayerHandlers(socket: AuthenticatedSocket): void {
 
       const player = instance.getPlayer(userId);
       if (outcome.caught && outcome.result) {
-        // Emit state update so the catcher's inventory, gems, and quests refresh (quest canComplete may have changed)
-        const [farm, quests] = await Promise.all([
-          Farm.findOne({ userId }).select('inventory gems').lean(),
-          questService.getQuestsForUser(userId),
-        ]);
-        const update: Record<string, unknown> = { quests };
-        if (farm) {
-          const inventoryRecord: Record<string, number> = {};
-          const inv = farm.inventory;
-          if (inv) {
-            const entries = inv instanceof Map ? inv.entries() : Object.entries(inv);
-            for (const [k, v] of entries) {
-              if (typeof v === 'number' && v > 0) inventoryRecord[k] = v;
-            }
-          }
-          update.inventory = inventoryRecord;
-          update.gems = farm.gems ?? 0;
-        }
-        emitToUser(userId, WS_EVENTS.GAME_STATE_UPDATE, update);
+        // The catch already reconciled quests, so forward that state as-is.
+        emitToUser(userId, WS_EVENTS.GAME_STATE_UPDATE, outcome.stateUpdate);
         const payload = {
           userId,
           username: player?.username ?? 'Anon',
@@ -221,6 +221,135 @@ export function registerMultiplayerHandlers(socket: AuthenticatedSocket): void {
       }
     } catch (err: any) {
       log.error({ userId, err: err.message }, 'mp:fish_result failed');
+    }
+  });
+
+  // ── Trade ─────────────────────────────────────────────────────────────
+
+  socket.on(WS_EVENTS.MP_TRADE_REQUEST, async (data: { targetUserId?: string }) => {
+    try {
+      const targetUserId = data?.targetUserId;
+      if (!targetUserId || typeof targetUserId !== 'string') {
+        socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: 'Missing target player' });
+        return;
+      }
+      const result = await tradeService.requestTrade(userId, targetUserId);
+      emitToUser(targetUserId, WS_EVENTS.MP_TRADE_REQUESTED, {
+        tradeId: result.tradeId,
+        fromUserId: result.initiator.userId,
+        fromUsername: result.initiator.username,
+        fromPetName: result.initiator.petName,
+        fromPetImageUrl: result.initiator.petImageUrl,
+      });
+      socket.emit(WS_EVENTS.MP_TRADE_STATE, {
+        tradeId: result.tradeId,
+        status: 'pending',
+        version: 1,
+        youUserId: userId,
+        partner: result.recipient,
+        yourOffer: [],
+        theirOffer: [],
+        youReady: false,
+        theyReady: false,
+        waitingForAccept: true,
+      });
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Trade request failed' });
+      log.warn({ userId, err: err.message }, 'mp:trade_request failed');
+    }
+  });
+
+  socket.on(WS_EVENTS.MP_TRADE_ACCEPT, async (data: { tradeId?: string }) => {
+    try {
+      const tradeId = data?.tradeId;
+      if (!tradeId) throw new Error('Missing tradeId');
+      const session = await tradeService.acceptTrade(userId, tradeId);
+      for (const uid of [session.initiatorUserId, session.recipientUserId]) {
+        const snap = tradeService.snapshotFor(tradeId, uid);
+        if (snap) emitToUser(uid, WS_EVENTS.MP_TRADE_OPEN, snap);
+      }
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Could not accept trade' });
+    }
+  });
+
+  socket.on(WS_EVENTS.MP_TRADE_DECLINE, async (data: { tradeId?: string }) => {
+    try {
+      const tradeId = data?.tradeId;
+      if (!tradeId) throw new Error('Missing tradeId');
+      const result = await tradeService.declineTrade(userId, tradeId);
+      emitToUser(result.initiatorUserId, WS_EVENTS.MP_TRADE_DECLINED, {
+        tradeId,
+        byUserId: userId,
+      });
+      socket.emit(WS_EVENTS.MP_TRADE_CANCELLED, { tradeId, reason: 'declined' });
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Could not decline trade' });
+    }
+  });
+
+  socket.on(
+    WS_EVENTS.MP_TRADE_UPDATE,
+    async (data: { tradeId?: string; items?: TradeOfferItem[] }) => {
+      try {
+        const tradeId = data?.tradeId;
+        if (!tradeId) throw new Error('Missing tradeId');
+        const items = Array.isArray(data?.items) ? data.items : [];
+        const { inventory } = await tradeService.updateOffer(userId, tradeId, items);
+        emitToUser(userId, WS_EVENTS.GAME_STATE_UPDATE, { inventory });
+        emitTradeSnapshots(tradeId);
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Could not update offer' });
+      }
+    },
+  );
+
+  socket.on(
+    WS_EVENTS.MP_TRADE_CONFIRM,
+    async (data: { tradeId?: string; version?: number }) => {
+      try {
+        const tradeId = data?.tradeId;
+        const version = data?.version;
+        if (!tradeId || typeof version !== 'number') throw new Error('Missing tradeId/version');
+        const result = await tradeService.confirm(userId, tradeId, version);
+        if (result.kind === 'waiting') {
+          emitTradeSnapshots(tradeId);
+          return;
+        }
+        const { session, inventories } = result;
+        for (const uid of [session.initiatorUserId, session.recipientUserId]) {
+          const inv = inventories[uid];
+          if (inv) emitToUser(uid, WS_EVENTS.GAME_STATE_UPDATE, { inventory: inv });
+          emitToUser(uid, WS_EVENTS.MP_TRADE_COMPLETE, {
+            tradeId,
+            partnerUserId:
+              uid === session.initiatorUserId
+                ? session.recipientUserId
+                : session.initiatorUserId,
+          });
+        }
+      } catch (err: any) {
+        socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Could not confirm trade' });
+      }
+    },
+  );
+
+  socket.on(WS_EVENTS.MP_TRADE_CANCEL, async (data: { tradeId?: string }) => {
+    try {
+      const tradeId = data?.tradeId;
+      if (!tradeId) throw new Error('Missing tradeId');
+      const result = await tradeService.cancelTrade(tradeId, userId);
+      if (!result) return;
+      for (const uid of [result.initiatorUserId, result.recipientUserId]) {
+        const inv = result.inventories[uid];
+        if (inv) emitToUser(uid, WS_EVENTS.GAME_STATE_UPDATE, { inventory: inv });
+        emitToUser(uid, WS_EVENTS.MP_TRADE_CANCELLED, {
+          tradeId,
+          reason: uid === userId ? 'You cancelled the trade' : 'Trade cancelled',
+        });
+      }
+    } catch (err: any) {
+      socket.emit(WS_EVENTS.MP_TRADE_ERROR, { message: err.message ?? 'Could not cancel trade' });
     }
   });
 
@@ -252,6 +381,17 @@ export function registerMultiplayerHandlers(socket: AuthenticatedSocket): void {
 
   function handleLeave(): void {
     const wasFishing = fishService.cancelFishing(userId);
+    void tradeService.cancelForUser(userId).then((cancelled) => {
+      if (!cancelled) return;
+      for (const uid of [cancelled.initiatorUserId, cancelled.recipientUserId]) {
+        const inv = cancelled.inventories[uid];
+        if (inv) emitToUser(uid, WS_EVENTS.GAME_STATE_UPDATE, { inventory: inv });
+        emitToUser(uid, WS_EVENTS.MP_TRADE_CANCELLED, {
+          tradeId: cancelled.tradeId,
+          reason: 'Player left the area',
+        });
+      }
+    });
     const result = multiplayerManager.leaveScene(userId);
     if (!result) return;
     socket.leave(result.roomName);

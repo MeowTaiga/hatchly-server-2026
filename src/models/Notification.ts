@@ -5,6 +5,12 @@ import { basePlugin } from './plugins/basePlugin.js';
 export const NOTIFICATION_TYPES = [
   'friend_request',
   'friend_accepted',
+  'fasting_complete',
+  'goal_reminder',
+  'marriage_proposal',
+  'marriage_accepted',
+  'shared_goal_complete',
+  'shared_goal_added',
 ] as const;
 
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];

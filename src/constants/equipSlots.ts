@@ -7,10 +7,13 @@
 export const HAND_TOOL_SUB_CATEGORIES = [
   'fishing_poles',
   'fishing_pole',
+  'net',
   'bug_net',
   'bug_nets',
   'pickaxe',
   'pickaxes',
+  'axe',
+  'axes',
   'shovel',
   'shovels',
 ] as const;

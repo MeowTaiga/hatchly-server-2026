@@ -14,7 +14,8 @@ const userRecipeJournalSchema = new Schema<IUserRecipeJournal>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   recipeId: { type: String, required: true },
   discoveredAt: { type: Date, required: true, default: Date.now },
-  timesCrafted: { type: Number, required: true, default: 1, min: 1 },
+  /** Starts at 0 when learned from a recipe scroll before first craft. */
+  timesCrafted: { type: Number, required: true, default: 0, min: 0 },
 });
 
 userRecipeJournalSchema.index({ userId: 1, recipeId: 1 }, { unique: true });

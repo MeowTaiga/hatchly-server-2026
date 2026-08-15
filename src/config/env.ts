@@ -13,6 +13,8 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(5000),
   NODE_ENV: z.enum(['dev', 'development', 'production', 'test']).default('dev'),
   CLIENT_URL: z.string().url().default('http://localhost:3000'),
+  /** Optional marketing site origin for CORS (e.g. https://hatchly.me) */
+  MARKETING_URL: z.string().url().optional(),
 
   // ── Auth ────────────────────────────────────────────────
   JWT_SECRET: z.string().min(10, 'JWT_SECRET must be at least 10 characters'),

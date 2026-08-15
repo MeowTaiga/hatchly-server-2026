@@ -1,15 +1,23 @@
-import { PetChat, MAX_MESSAGES, type IPetChatSuggest } from '../models/PetChat.js';
+import { PetChat, MAX_MESSAGES, type IPetChatSuggest, type IPetChatGoalCard } from '../models/PetChat.js';
 import { User } from '../models/User.js';
 import { MoodLog } from '../models/MoodLog.js';
 import { openAIService, type ChatMessage } from './OpenAIService.js';
 import { createQueryUserDataTool } from './PetDataToolService.js';
+import { createGoalTools, autoCreateCustomGoalFromChat, type GoalToolBag } from './PetGoalToolService.js';
 import { getTodaySummary, getTodayDateStr } from '../utils/getYesterdaySummary.js';
+import { getFastingChatContext } from './FastingService.js';
+import { formatGoalsForPrompt, getGoalsToday } from './GoalService.js';
 import { SUGGESTION_IDS } from '../constants/suggestionTypes.js';
 import { createLogger } from '../config/logger.js';
 import { isDev } from '../config/env.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import { skillXpService } from './SkillXpService.js';
 
 const log = createLogger('PetChatService');
+
+/** Cap social XP from chat so spam doesn't grind Social to 99. */
+const MAX_CHAT_SKILL_XP_PER_DAY = 10;
 
 const SUGGESTION_PROMPT = `
 SUGGESTIONS: You can optionally suggest wellness activities. Add at the very end of your message (after your text, on a new line):
@@ -66,7 +74,19 @@ GOAL: You are a diary & mood motivation companion. Focus on physical & mental we
 STYLE: Type like texting. Prefer short responses (1-2 sentences) when it fits; only go longer if the topic really needs it. Often use casual shorthand: "u", "ur", "r", "idk" — mix it up. You have feelings, react to the conversation, reference what they've said. Be chat-aware.`;
 
 const DATA_TOOL_PROMPT = `
-DATA: You have access to a tool query_user_data to look up the user's wellness data (food, water, mood, weight, quests, achievements, login streaks) when they ask. Use it when the user asks about their data. Never guess — query if unsure.`;
+DATA: You have access to a tool query_user_data to look up the user's wellness data (food, water, mood, weight, fasting, quests, achievements, login streaks) when they ask. Use it when the user asks about their data. Never guess — query if unsure.`;
+
+const GOALS_TOOL_PROMPT = `
+GOALS: Self-care goals (health + social XP when checked off). Two kinds:
+1) PREMADE catalog (Drink water, Take a walk, Journal, Stretch, Clean up, Wind down, Brush teeth, Eat a fruit, Get some sun). You may ONLY toggle these on/off with toggle_catalog_goal. Never change their title, days, or reminder.
+2) CUSTOM goals the user invents. Always create these with create_goal, even if they sound similar to a premade one. "Deep clean kitchen on Saturdays" is NOT "Clean up". "Evening walk around the block" is NOT "Take a walk". Similar is fine — create it.
+- Repeat: daily, certain weekdays, or once (one-time; stays checked until the next calendar day). If they say "just this once" / "one time" / "doesn't repeat", use repeat=once.
+- When they describe a specific habit ("deep clean the kitchen every Saturday"), call create_goal immediately with a SHORT 2–6 word title (e.g. "Deep clean kitchen") plus days. Never use their whole sentence as the title. Sunday=0 … Saturday=6 (Saturday=6, Friday=5). A card appears in chat; mention you added it.
+- toggle_catalog_goal only when they clearly mean the exact premade name ("turn on stretch", "disable clean up").
+- When they did a goal / want to check one off, call offer_complete_goal. Do not mark it complete yourself. If already done, just celebrate.
+- After they send "I finished …", just cheer.
+- Do not use [SUGGEST] for something that is already a goal.
+- Duplicate custom goals only if the title is the exact same custom title already on. Never refuse a more specific goal because a premade one exists. If a custom goal was already created this turn, celebrate it.`;
 
 export interface ChatMessageEntry {
   id: string;
@@ -74,6 +94,7 @@ export interface ChatMessageEntry {
   content: string;
   createdAt: string;
   suggest?: { component: string; content: string; title: string };
+  goalCards?: IPetChatGoalCard[];
 }
 
 function toEntry(m: {
@@ -82,6 +103,7 @@ function toEntry(m: {
   content: string;
   createdAt: Date;
   suggest?: IPetChatSuggest;
+  goalCards?: IPetChatGoalCard[];
 }): ChatMessageEntry {
   return {
     id: (m._id && typeof (m._id as any).toString === 'function') ? (m._id as any).toString() : String(Date.now()),
@@ -89,13 +111,48 @@ function toEntry(m: {
     content: m.content,
     createdAt: (m.createdAt instanceof Date ? m.createdAt : new Date(m.createdAt)).toISOString(),
     ...(m.suggest && { suggest: m.suggest }),
+    ...(m.goalCards?.length ? { goalCards: m.goalCards } : {}),
   };
 }
 
-export async function getHistory(userId: string, timezone?: string): Promise<ChatMessageEntry[]> {
+/** Default page size for chat history. */
+export const HISTORY_PAGE_SIZE = 50;
+const HISTORY_MAX_PAGE_SIZE = 100;
+
+export interface ChatHistoryPage {
+  /** Oldest-to-newest within the page. */
+  messages: ChatMessageEntry[];
+  /** True when older messages exist before this page. */
+  hasMore: boolean;
+}
+
+/**
+ * Returns a page of chat history, newest page first.
+ *
+ * @param before - Message id to page backwards from. Omit for the newest page.
+ */
+export async function getHistory(
+  userId: string,
+  opts: { limit?: number; before?: string } = {},
+): Promise<ChatHistoryPage> {
+  const limit = Math.min(Math.max(opts.limit ?? HISTORY_PAGE_SIZE, 1), HISTORY_MAX_PAGE_SIZE);
   const doc = await PetChat.findOne({ userId }).lean();
-  if (!doc?.messages?.length) return [];
-  return doc.messages.map(toEntry);
+  const all = doc?.messages ?? [];
+  if (!all.length) return { messages: [], hasMore: false };
+
+  let end = all.length;
+  if (opts.before) {
+    const idx = all.findIndex((m) => String((m as { _id?: unknown })._id) === opts.before);
+    // Unknown cursor: the client is paging from something we no longer store.
+    if (idx === -1) return { messages: [], hasMore: false };
+    end = idx;
+  }
+
+  const start = Math.max(0, end - limit);
+  return {
+    messages: all.slice(start, end).map(toEntry),
+    hasMore: start > 0,
+  };
 }
 
 /**
@@ -135,12 +192,19 @@ export async function getChatStatus(userId: string, timezone?: string): Promise<
   return { needsMoodToday: !hasMoodToday && !hasChatToday };
 }
 
-export async function sendMessage(userId: string, userContent: string): Promise<{ message: ChatMessageEntry; reply: ChatMessageEntry }> {
+export async function sendMessage(
+  userId: string,
+  userContent: string,
+): Promise<{ message: ChatMessageEntry; reply: ChatMessageEntry; xpGained?: number }> {
   const user = await User.findById(userId).select('pet username timezone').lean();
   if (!user) throw new AppError('User not found', 404, 'USER_NOT_FOUND');
   if (!user.pet) throw new AppError('Set up your pet first', 400, 'NO_PET');
 
-  const todaySummary = await getTodaySummary(userId, (user as any).timezone);
+  const [todaySummary, fastingContext, goalsState] = await Promise.all([
+    getTodaySummary(userId, (user as any).timezone),
+    getFastingChatContext(userId),
+    getGoalsToday(userId).catch(() => null),
+  ]);
 
   const todayParts: string[] = [];
   if (todaySummary.foods.length > 0) {
@@ -153,7 +217,9 @@ export async function sendMessage(userId: string, userContent: string): Promise<
   }
   todayParts.push(`${todaySummary.waterOz} oz water`);
   if (todaySummary.weightLbs != null) todayParts.push(`${todaySummary.weightLbs} lbs`);
-  if (todaySummary.mood) todayParts.push(`mood today: ${todaySummary.mood}`);
+  if (todaySummary.moodDiary) todayParts.push(`mood diary today: ${todaySummary.moodDiary}`);
+  else if (todaySummary.mood) todayParts.push(`mood today: ${todaySummary.mood}`);
+  if (fastingContext) todayParts.push(fastingContext);
   const todayContext = todayParts.join('; ');
 
   const petState: PetState = {
@@ -166,7 +232,16 @@ export async function sendMessage(userId: string, userContent: string): Promise<
   };
 
   const context = buildPetContextPrompt(petState, todayContext);
-  const systemContent = `You are a cute, supportive pet companion in a wellness + farming game. Chat with your human friend. ${context}${GUARDRAILS_SYSTEM_SUFFIX}${PERSONALITY_PROMPT}${DATA_TOOL_PROMPT}${SUGGESTION_PROMPT}`;
+  const goalsBlock = goalsState
+    ? `\nCurrent goals (id | kind | title | status | schedule). Sunday=0:\n${formatGoalsForPrompt(goalsState)}`
+    : '';
+
+  const goalBag: GoalToolBag = { cards: [] };
+  const autoCreated = await autoCreateCustomGoalFromChat(userId, userContent, goalBag);
+  const autoNote = autoCreated
+    ? `\nIMPORTANT: A custom goal was already created for this message: "${autoCreated.goal.title}" (${autoCreated.goal.repeat === 'daily' ? 'every day' : `days ${autoCreated.goal.repeatDays.join(',')}`}). Tell them you added it. A card will appear. NEVER say you cannot, that it's not allowed, or that a similar premade goal (like Clean up) already covers it. Do not call create_goal again for this.`
+    : '';
+  const systemContent = `You are a cute, supportive pet companion in a wellness + farming game. Chat with your human friend. ${context}${goalsBlock}${autoNote}${GUARDRAILS_SYSTEM_SUFFIX}${PERSONALITY_PROMPT}${DATA_TOOL_PROMPT}${GOALS_TOOL_PROMPT}${SUGGESTION_PROMPT}`;
 
   let chatDoc = await PetChat.findOne({ userId });
   if (!chatDoc) {
@@ -183,7 +258,7 @@ export async function sendMessage(userId: string, userContent: string): Promise<
 
   log.info({ userId, userContent: userContent.slice(0, 80), historyLen: recentHistory.length }, 'Pet chat: sending to OpenAI');
 
-  const tools = [createQueryUserDataTool(userId)];
+  const tools = [createQueryUserDataTool(userId), ...createGoalTools(userId, goalBag, userContent)];
 
   let replyText: string;
   let completionId: string | undefined;
@@ -230,12 +305,19 @@ export async function sendMessage(userId: string, userContent: string): Promise<
   const replyContent = stripped || (suggest ? "Here's something to try! ✨" : "Hmm, tell me more!");
 
   const now = new Date();
-  const assistantMsg: { role: 'assistant'; content: string; createdAt: Date; suggest?: IPetChatSuggest } = {
+  const assistantMsg: {
+    role: 'assistant';
+    content: string;
+    createdAt: Date;
+    suggest?: IPetChatSuggest;
+    goalCards?: IPetChatGoalCard[];
+  } = {
     role: 'assistant',
     content: replyContent,
     createdAt: now,
   };
   if (suggest) assistantMsg.suggest = suggest;
+  if (goalBag.cards.length) assistantMsg.goalCards = goalBag.cards.slice(-3);
 
   chatDoc.messages.push(
     { role: 'user', content: userContent, createdAt: now },
@@ -251,5 +333,19 @@ export async function sendMessage(userId: string, userContent: string): Promise<
   const userEntry = toEntry(lastUser!);
   const replyEntry = toEntry(lastReply!);
 
-  return { message: userEntry, reply: replyEntry };
+  // Social XP for chatting — capped per calendar day.
+  let xpGained = 0;
+  const timezone = (user as { timezone?: string }).timezone;
+  const today = getTodayDateStr(timezone);
+  const userMsgsToday = chatDoc.messages.filter(
+    (m) =>
+      m.role === 'user' &&
+      (m.createdAt as Date).toISOString().slice(0, 10) === today,
+  ).length;
+  if (userMsgsToday <= MAX_CHAT_SKILL_XP_PER_DAY) {
+    const grant = await skillXpService.grant(userId, 'social', SKILL_XP_REWARDS.pet_chat);
+    xpGained = grant?.gained[0]?.amount ?? 0;
+  }
+
+  return { message: userEntry, reply: replyEntry, xpGained };
 }

@@ -7,9 +7,11 @@ import { catchAsync } from '../utils/catchAsync.js';
 import { success } from '../utils/response.js';
 import { Friend } from '../models/Friend.js';
 import { User } from '../models/User.js';
+import { Farm } from '../models/Farm.js';
 import { normalizePhone } from '../utils/phone.js';
 import { notificationService } from '../services/NotificationService.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { farmService } from '../services/FarmService.js';
 
 const router = Router();
 
@@ -25,17 +27,32 @@ function toMinimalUser(user: {
   _id: mongoose.Types.ObjectId;
   username?: string;
   phone: string;
-  pet?: { name: string; customName: string; imageUrl: string };
-}) {
+  lastLogin?: Date;
+  pet?: {
+    name: string;
+    customName: string;
+    imageUrl: string;
+    level?: number;
+    happy?: number;
+    hunger?: number;
+    mood?: number;
+  };
+}, farmLevel?: number) {
   return {
     id: user._id.toString(),
     username: user.username ?? undefined,
     phone: maskPhone(user.phone),
+    lastLogin: user.lastLogin?.toISOString?.() ?? undefined,
+    farmLevel: farmLevel ?? undefined,
     pet: user.pet
       ? {
           name: user.pet.name,
           customName: user.pet.customName,
           imageUrl: user.pet.imageUrl,
+          level: user.pet.level ?? 1,
+          happy: user.pet.happy ?? 100,
+          hunger: user.pet.hunger ?? 100,
+          mood: user.pet.mood ?? 100,
         }
       : undefined,
   };
@@ -232,24 +249,45 @@ router.get(
           { toUserId: meObjectId, status: 'accepted' },
         ],
       })
-        .populate('fromUserId', 'username phone pet')
-        .populate('toUserId', 'username phone pet')
+        .populate('fromUserId', 'username phone pet lastLogin')
+        .populate('toUserId', 'username phone pet lastLogin')
         .lean(),
       Friend.find({ fromUserId: meObjectId, status: 'pending' })
-        .populate('toUserId', 'username phone pet')
+        .populate('toUserId', 'username phone pet lastLogin')
         .lean(),
       Friend.find({ toUserId: meObjectId, status: 'pending' })
-        .populate('fromUserId', 'username phone pet')
+        .populate('fromUserId', 'username phone pet lastLogin')
         .lean(),
     ]);
 
+    const friendUserIds = acceptedDocs.map((doc) => {
+      const other =
+        (doc.fromUserId as { _id: mongoose.Types.ObjectId })._id.toString() === meId
+          ? doc.toUserId
+          : doc.fromUserId;
+      return (other as { _id: mongoose.Types.ObjectId })._id;
+    });
+
+    const farms = friendUserIds.length
+      ? await Farm.find({ userId: { $in: friendUserIds } }).select('userId farmLevel').lean()
+      : [];
+    const farmLevelByUser = new Map<string, number>();
+    for (const farm of farms) {
+      const level = farmService.farmLevelOf({ farmLevel: farm.farmLevel ?? 1 });
+      farmLevelByUser.set(farm.userId.toString(), level.level);
+    }
+
     const friends = acceptedDocs.map((doc) => {
       const other =
-        doc.fromUserId._id.toString() === meId ? doc.toUserId : doc.fromUserId;
+        (doc.fromUserId as { _id: mongoose.Types.ObjectId })._id.toString() === meId
+          ? doc.toUserId
+          : doc.fromUserId;
+      const otherId = (other as { _id: mongoose.Types.ObjectId })._id.toString();
       return {
         id: doc._id.toString(),
-        user: toMinimalUser(other as any),
+        user: toMinimalUser(other as any, farmLevelByUser.get(otherId)),
         status: 'accepted',
+        friendsSince: (doc as { createdAt?: Date }).createdAt?.toISOString?.(),
       };
     });
 

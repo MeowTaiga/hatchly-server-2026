@@ -3,7 +3,8 @@ import { basePlugin } from './plugins/basePlugin.js';
 
 /**
  * Tracks daily login rewards per user. One document per user per calendar day (user timezone).
- * Used to ensure first-login-of-the-day rewards (fossil holes + AI greeting) are granted only once.
+ * Used to ensure first-login-of-the-day rewards (fossil holes, stones/sticks, AI greeting)
+ * are granted only once.
  */
 export interface IDailyLoginReward extends Document {
   userId: mongoose.Types.ObjectId;

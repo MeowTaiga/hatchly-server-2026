@@ -2,7 +2,14 @@ import { Scene } from '../models/Scene.js';
 import { GameItemDef, type IGameItemDef, type BugRarity, type BugActiveTime } from '../models/GameItemDef.js';
 import { UserCollection } from '../models/UserCollection.js';
 import { Farm } from '../models/Farm.js';
-import { questService } from './QuestService.js';
+import { questService } from './quests/index.js';
+import { withQuestSync, type StateUpdate } from './FarmService.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import {
+  adjustMinigameDifficulty,
+  fishingDifficultyRelief,
+} from '../constants/skillPerks.js';
+import { attachSkillXp, getUserSkillLevel, skillXpService } from './SkillXpService.js';
 import { createLogger } from '../config/logger.js';
 import { RARITY_WEIGHTS, RARITY_TO_DIFFICULTY } from '../utils/rarity.js';
 
@@ -100,7 +107,13 @@ interface AwaitingResult {
   sceneSlug: string;
   col: number;
   row: number;
+  /** Server timestamp when the bite fired — used to validate reel window. */
+  biteAt: number;
 }
+
+/** Min/max time after bite before a result is accepted (anti instant-pass spam). */
+const MIN_REEL_MS = 1_200;
+const MAX_REEL_MS = 45_000;
 
 const pendingMap = new Map<string, PendingBite>();
 const awaitingResultMap = new Map<string, AwaitingResult>();
@@ -129,7 +142,12 @@ export const fishService = {
       const pending = pendingMap.get(userId);
       if (!pending) return;
       pendingMap.delete(userId);
-      awaitingResultMap.set(userId, { sceneSlug: pending.sceneSlug, col: pending.col, row: pending.row });
+      awaitingResultMap.set(userId, {
+        sceneSlug: pending.sceneSlug,
+        col: pending.col,
+        row: pending.row,
+        biteAt: Date.now(),
+      });
       onBite(userId);
     }, delayMs);
 
@@ -150,6 +168,11 @@ export const fishService = {
   ): Promise<FishCatchResult | null> {
     const result = await this.rollFish(sceneSlug, col, row, timezone);
     if (result) {
+      const fishingLevel = await getUserSkillLevel(userId, 'fishing');
+      result.difficulty = adjustMinigameDifficulty(
+        result.difficulty ?? 2,
+        fishingDifficultyRelief(fishingLevel),
+      );
       preRollMap.set(userId, result);
     }
     return result;
@@ -163,13 +186,20 @@ export const fishService = {
     userId: string,
     passed: boolean,
     timezone?: string,
-  ): Promise<{ caught: false } | { caught: true; result: FishCatchResult }> {
+  ): Promise<{ caught: false } | { caught: true; result: FishCatchResult; stateUpdate: StateUpdate }> {
     const awaiting = awaitingResultMap.get(userId);
     awaitingResultMap.delete(userId);
     const preRolled = preRollMap.get(userId);
     preRollMap.delete(userId);
     if (!awaiting) return { caught: false };
     if (!passed) return { caught: false };
+
+    // Server-owned reel window — reject instant / stale client "passed" claims.
+    const elapsed = Date.now() - awaiting.biteAt;
+    if (elapsed < MIN_REEL_MS || elapsed > MAX_REEL_MS) {
+      log.warn({ userId, elapsed }, 'Fish result rejected — outside server reel window');
+      return { caught: false };
+    }
 
     const result = preRolled ?? await this.rollFish(awaiting.sceneSlug, awaiting.col, awaiting.row, timezone);
     if (!result) return { caught: false };
@@ -193,10 +223,22 @@ export const fishService = {
       await farm.save();
     }
 
-    await questService.trackAction(userId, 'catch', result.itemType);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'catch', itemType: result.itemType });
+    const skillGrant = await skillXpService.grant(userId, 'fishing', SKILL_XP_REWARDS.fish_catch);
+
+    const inventory: Record<string, number> = {};
+    if (farm) {
+      for (const [k, v] of farm.inventory) {
+        if (v > 0) inventory[k] = v;
+      }
+    }
 
     log.info({ userId, itemType: result.itemType, size: result.size, gemsAwarded: result.gemsAwarded }, 'Fish caught');
-    return { caught: true, result };
+    return {
+      caught: true,
+      result,
+      stateUpdate: attachSkillXp(withQuestSync({ inventory, gems: farm?.gems ?? 0 }, sync), skillGrant),
+    };
   },
 
   /**
@@ -278,7 +320,7 @@ export const fishService = {
     const sizeMax = (def as any).fishSizeMax ?? 2.0;
     const size = bellCurveRandom(sizeMin, sizeMax);
     const rarity: BugRarity = (def as any).fishRarity ?? 'common';
-    const difficulty = RARITY_TO_DIFFICULTY[rarity];
+    const baseDifficulty = RARITY_TO_DIFFICULTY[rarity];
     const sizeLabel = getSizeLabel(size, sizeMin, sizeMax);
 
     return {
@@ -289,7 +331,7 @@ export const fishService = {
       rarity,
       gemsAwarded: 0,
       imageUrl: def.imageUrl,
-      difficulty,
+      difficulty: baseDifficulty,
     };
   },
 };

@@ -4,15 +4,106 @@ import { getTodayDateStr, getDaysAgoDateStr } from '../utils/getYesterdaySummary
 import { Scene } from '../models/Scene.js';
 import { SLOT_TO_SUB_CATEGORIES } from '../constants/equipSlots.js';
 import { BakedScenery } from '../models/BakedScenery.js';
-import { type IDialogStep } from '../models/QuestDef.js';
 import { createLogger } from '../config/logger.js';
-import { questService, type QuestProgressPayload } from './QuestService.js';
+import {
+  questService,
+  type QuestCompletion,
+  type QuestDialog,
+  type QuestEvent,
+  type QuestPayload,
+  type QuestSync,
+} from './quests/index.js';
 import { petService, type PublicPet } from './PetService.js';
 import { petBehaviorStore, PET_DEFAULT_COL, PET_DEFAULT_ROW } from './PetBehaviorStore.js';
 import { createTreeTiles } from './TreeService.js';
+import { ensureStarterCraftingRecipes } from './StarterCraftingRecipes.js';
+import { syncCraftingRecipesThroughLevel } from './CraftingLevelRecipeUnlocks.js';
+import { syncCookingRecipesThroughLevel } from './CookingLevelRecipeUnlocks.js';
+import { syncFarmingSoilThroughLevel } from './FarmingLevelSoilGrants.js';
+import {
+  appendFossilHoles,
+  buildPlacedItemsWithDailyGroundPickups,
+} from './GroundPickupService.js';
+import { User } from '../models/User.js';
+import { UserQuest } from '../models/UserQuest.js';
+import { weatherService, type ActiveWeather } from './WeatherService.js';
+import { SKILL_XP_REWARDS } from '../constants/skills.js';
+import { STARTER_NPC_DEPARTURE_QUEST_ID, STARTER_NPC_ITEM_TYPE } from './quests/constants.js';
+import { attachSkillXp, getUserSkillLevel, skillXpService } from './SkillXpService.js';
+import { backpackSlotsFromCraftingLevel, harvestSeedReturnChance } from '../constants/skillPerks.js';
+import { syncMiningEnergy, miningEnergyStateUpdate } from './MiningEnergy.js';
+import type { SkillXpStatePayload } from './SkillXpService.js';
+import {
+  addToBackpack,
+  canFitInBackpack,
+  getBackpackSlots,
+  grantLoot,
+  mapToRecord,
+  takeFromBackpack,
+  takeFromStorage,
+  addToStorage,
+} from './inventoryCapacity.js';
 import crypto from 'crypto';
 
 const log = createLogger('FarmService');
+
+/**
+ * Grants produce from harvestYield (never the planted seed) plus a farming-perk
+ * roll for a single seed return. Guaranteed self-seed drops in item defs are
+ * ignored even if a stale def still lists them.
+ */
+function grantCropHarvestLoot(
+  farm: IFarm,
+  plantedItemType: string,
+  harvestYield: { itemType: string; qty: number }[],
+  farmingLevel: number,
+): string[] {
+  const yielded: string[] = [];
+  for (const drop of harvestYield) {
+    if (drop.itemType === plantedItemType) continue;
+    grantLoot(farm, drop.itemType, drop.qty);
+    yielded.push(drop.itemType);
+  }
+  const chance = harvestSeedReturnChance(farmingLevel);
+  if (chance > 0 && Math.random() * 100 < chance) {
+    grantLoot(farm, plantedItemType, 1);
+    yielded.push(plantedItemType);
+  }
+  return yielded;
+}
+
+/** Farm-placed house occupies 2 rows; art overflows that pad via centerOverflow. */
+const HOUSE_PLACE_ROWS = 2;
+/** Sell box & mailbox sit on the first farm row by default. */
+const STARTER_YARD_TOP_ROW = 0;
+const STARTER_BOX_TYPES = ['sell_box', 'mail_box'] as const;
+
+/** Sync farm.backpackSlots from crafting skill milestones (server source of truth). */
+async function syncBackpackSlotsFromCrafting(userId: string, farm: IFarm): Promise<number> {
+  const craftingLevel = await getUserSkillLevel(userId, 'crafting');
+  const slots = backpackSlotsFromCraftingLevel(craftingLevel);
+  if (farm.backpackSlots !== slots) {
+    farm.backpackSlots = slots;
+    farm.markModified('backpackSlots');
+  }
+  return slots;
+}
+
+/** Keeps first occurrence of each placed-item id (repairs accidental double-pushes). */
+function dedupePlacedItemsById(items: IPlacedItem[]): { items: IPlacedItem[]; removed: number } {
+  const seen = new Set<string>();
+  const out: IPlacedItem[] = [];
+  let removed = 0;
+  for (const item of items) {
+    if (seen.has(item.id)) {
+      removed += 1;
+      continue;
+    }
+    seen.add(item.id);
+    out.push(item);
+  }
+  return { items: out, removed };
+}
 
 // ─── XP Config (admin-editable later) ───────────────────────────────────────
 
@@ -42,43 +133,31 @@ export const FARM_LEVELS = [
 const DEFAULT_GRID_COLS = FARM_LEVELS[0].cols;
 const DEFAULT_GRID_ROWS = FARM_LEVELS[0].rows;
 
-const STARTER_INVENTORY: Record<string, number> = {
-  soil: 1,
-  wheat_seed: 3,
-};
+/** New farms start empty. Soil and wheat seeds come from Bramble; more soil from farming levels. */
+const STARTER_INVENTORY: Record<string, number> = {};
+
+export type FarmLevelDef = (typeof FARM_LEVELS)[number];
 
 /**
- * Resolves the effective farm level, accounting for completed upgrade quests.
- * A user's effective level is the highest level where:
- *   1. XP >= that level's threshold, AND
- *   2. The upgrade quest for that level is completed (or it's level 1).
+ * The farm's level definition. Level is a stored field raised only by finishing
+ * that level's upgrade quest, so this is a plain lookup — no database round trip
+ * and no inferring the level from quest ids.
  */
-export async function resolveFarmLevel(userId: string, xp: number) {
-  const completedLevels = await questService.getCompletedFarmLevels(userId);
-
-  for (let i = FARM_LEVELS.length - 1; i >= 0; i--) {
-    const lvl = FARM_LEVELS[i];
-    if (xp >= lvl.xpRequired && (lvl.level === 1 || completedLevels.has(lvl.level))) {
-      return lvl;
-    }
-  }
-  return FARM_LEVELS[0];
+export function farmLevelOf(farm: Pick<IFarm, 'farmLevel'>): FarmLevelDef {
+  const level = farm.farmLevel ?? 1;
+  return FARM_LEVELS.find((l) => l.level === level) ?? FARM_LEVELS[0];
 }
 
-/** XP-only level resolution (no quest check). Used for XP capping. */
-function resolveXpLevel(xp: number) {
-  for (let i = FARM_LEVELS.length - 1; i >= 0; i--) {
-    if (xp >= FARM_LEVELS[i].xpRequired) return FARM_LEVELS[i];
-  }
-  return FARM_LEVELS[0];
+export function farmLevelByNumber(level: number): FarmLevelDef {
+  return FARM_LEVELS.find((l) => l.level === level) ?? FARM_LEVELS[0];
 }
 
 /**
- * Resolves grid dimensions for a farm level. Uses scene dimensions when a scene
- * exists for this level (admin-editable in scene editor); otherwise uses level defaults.
+ * Grid dimensions for a farm. Prefers the scene authored for this level so the
+ * admin scene editor stays the source of truth for playable area.
  */
-async function resolveGridDimensions(userId: string, xp: number): Promise<{ gridCols: number; gridRows: number }> {
-  const level = await resolveFarmLevel(userId, xp);
+async function resolveGridDimensions(farm: Pick<IFarm, 'farmLevel'>): Promise<{ gridCols: number; gridRows: number }> {
+  const level = farmLevelOf(farm);
   const sceneSlug = `farm_${level.cols}x${level.rows}`;
   const scene = await Scene.findOne({ slug: sceneSlug }).select('farmCols farmRows').lean();
   return {
@@ -88,15 +167,13 @@ async function resolveGridDimensions(userId: string, xp: number): Promise<{ grid
 }
 
 /**
- * Awards XP, capping at the next level's threshold.
- * Once XP reaches the next level's requirement, no more XP is awarded
- * until the user completes the upgrade quest.
+ * XP accumulates without a ceiling. It used to be clamped at the next level's
+ * threshold to force players through the upgrade quest, which just looked like
+ * the XP bar had frozen; the quest itself is the gate, so authors who want XP to
+ * matter add a farmXp requirement to it.
  */
 function awardXp(farm: IFarm, amount: number): void {
-  const currentLevel = resolveXpLevel(farm.xp);
-  const nextLevel = FARM_LEVELS.find((l) => l.level === currentLevel.level + 1);
-  if (!nextLevel) return; // max level, no more XP
-  farm.xp = Math.min(farm.xp + amount, nextLevel.xpRequired);
+  farm.xp += amount;
 }
 
 // ─── Snapshot Types ─────────────────────────────────────────────────────────
@@ -124,6 +201,22 @@ export interface EquippedSnapshot {
   chair?: string;
 }
 
+export interface ScenePlacementSnapshot {
+  id: string;
+  itemType: string;
+  x: number;
+  y: number;
+  scale: number;
+  scaleX?: number;
+  scaleY?: number;
+  depthOffset?: number;
+  rotationDegrees?: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  /** Not baked — client draws as a depth-sorted sprite. */
+  live?: boolean;
+}
+
 export interface GameSnapshot {
   farmName: string;
   farmXp: number;
@@ -131,6 +224,15 @@ export interface GameSnapshot {
   farmLevel: number;
   farmLevels: typeof FARM_LEVELS;
   inventory: Record<string, number>;
+  /** Farm-wide vault (uncapped). */
+  storage: Record<string, number>;
+  /** Max backpack stacks. */
+  backpackSlots: number;
+  /** Mining stamina remaining after regen. */
+  miningEnergy: number;
+  miningEnergyCap: number;
+  /** Epoch ms when miningEnergy was last accurate. */
+  miningEnergyAt: number;
   placedItems: PlacedItemSnapshot[];
   equipped?: EquippedSnapshot;
   /** Food dish queues keyed by anchorId. */
@@ -144,16 +246,13 @@ export interface GameSnapshot {
   /** When farm has a scene with baked image, use these for world size instead of padded procedural dims. */
   sceneWorldCols?: number;
   sceneWorldRows?: number;
-  quests: QuestProgressPayload[];
+  /** Sent alongside a scene bake so taps can still hit-test what the PNG flattened. */
+  scenePlacements?: ScenePlacementSnapshot[];
+  quests: QuestPayload[];
   canUpgrade: boolean;
-  pendingDialogs?: { questId: string; dialog: IDialogStep[] }[];
-}
-
-export interface AutoCompletedQuest {
-  questId: string;
-  endDialog?: IDialogStep[];
-  nextQuestId?: string;
-  nextQuestStartDialog?: IDialogStep[];
+  questDialogs?: QuestDialog[];
+  /** Shared US world weather (America/New_York calendar). */
+  weather: ActiveWeather;
 }
 
 export interface StateUpdate {
@@ -161,17 +260,27 @@ export interface StateUpdate {
   gems?: number;
   farmLevel?: number;
   inventory?: Record<string, number>;
+  storage?: Record<string, number>;
+  backpackSlots?: number;
+  miningEnergy?: number;
+  miningEnergyCap?: number;
+  miningEnergyAt?: number;
   equipped?: EquippedSnapshot;
   foodDishQueues?: Record<string, string[]>;
   addedItems?: PlacedItemSnapshot[];
   removedItemIds?: string[];
   movedItems?: PlacedItemSnapshot[];
   farmName?: string;
-  quests?: QuestProgressPayload[];
+  quests?: QuestPayload[];
   canUpgrade?: boolean;
-  autoCompletedQuests?: AutoCompletedQuest[];
+  /** Quests that finished as a result of this action, for the reward celebration. */
+  questCompletions?: QuestCompletion[];
+  /** Dialogs the app should present, in order. */
+  questDialogs?: QuestDialog[];
   /** When present, client should apply pet update (e.g. mood raised from farm action). */
   pet?: PublicPet;
+  /** Skill XP earned by this action — client syncs HUD + shows feedback. */
+  skillXp?: SkillXpStatePayload;
   /** Tree shake result — client shows jiggle+shrink harvest effect and bubble. */
   shakeResult?: {
     drops: Array<{ itemType: string; qty: number }>;
@@ -185,6 +294,33 @@ export interface StateUpdate {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Folds a quest sync into a state update. Every gameplay action reports quest
+ * progress the same way through this, rather than each one re-deriving the
+ * level, the upgrade flag and the quest list for itself.
+ *
+ * The farm fields are only overwritten when a completion actually changed the
+ * economy, so an action's own inventory/gems numbers survive untouched.
+ */
+export function withQuestSync(update: StateUpdate, sync: QuestSync): StateUpdate {
+  update.quests = sync.quests;
+  update.canUpgrade = sync.canUpgrade;
+  update.farmLevel = sync.farmLevel;
+
+  if (sync.farmChanged) {
+    update.inventory = sync.inventory;
+    update.gems = sync.gems;
+    update.farmXp = sync.farmXp;
+  }
+  if (sync.removedItemIds?.length) {
+    update.removedItemIds = [...new Set([...(update.removedItemIds ?? []), ...sync.removedItemIds])];
+  }
+  if (sync.completed.length > 0) update.questCompletions = sync.completed;
+  if (sync.dialogs.length > 0) update.questDialogs = sync.dialogs;
+
+  return update;
+}
 
 function genId(): string {
   return crypto.randomBytes(8).toString('hex');
@@ -209,11 +345,7 @@ function toPlacedSnapshot(item: IPlacedItem): PlacedItemSnapshot {
 }
 
 function inventoryToRecord(map: Map<string, number>): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [k, v] of map) {
-    if (v > 0) out[k] = v;
-  }
-  return out;
+  return mapToRecord(map);
 }
 
 async function loadItemDefsMap(): Promise<Record<string, IGameItemDef>> {
@@ -249,6 +381,54 @@ function hasCollision(
 }
 
 const SOIL_INNER_INSET = 1;
+
+/**
+ * Trees may sit on top of any other item — only other trees and soil's inner
+ * plantable area block them. Mirrors `canPlaceTree` on the client.
+ */
+function hasTreeConflict(
+  placedItems: IPlacedItem[],
+  itemDefsMap: Record<string, { category?: string }>,
+  col: number,
+  row: number,
+  cols: number,
+  rows: number,
+  excludeAnchorId?: string,
+): boolean {
+  const blocked = new Set<string>();
+
+  for (const item of placedItems) {
+    if (item.anchorId) continue;
+    if (excludeAnchorId && item.id === excludeAnchorId) continue;
+    const category = itemDefsMap[item.itemType]?.category;
+
+    if (category === 'tree') {
+      for (let dr = 0; dr < (item.tileRows ?? 1); dr++) {
+        for (let dc = 0; dc < (item.tileCols ?? 1); dc++) {
+          blocked.add(`${item.col + dc}:${item.row + dr}`);
+        }
+      }
+      continue;
+    }
+
+    if (category === 'soil') {
+      const innerCols = Math.max(0, item.tileCols - 2 * SOIL_INNER_INSET);
+      const innerRows = Math.max(0, item.tileRows - 2 * SOIL_INNER_INSET);
+      for (let dr = 0; dr < innerRows; dr++) {
+        for (let dc = 0; dc < innerCols; dc++) {
+          blocked.add(`${item.col + SOIL_INNER_INSET + dc}:${item.row + SOIL_INNER_INSET + dr}`);
+        }
+      }
+    }
+  }
+
+  for (let dr = 0; dr < rows; dr++) {
+    for (let dc = 0; dc < cols; dc++) {
+      if (blocked.has(`${col + dc}:${row + dr}`)) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Soil cannot be placed on top of the inner plantable area of existing soil.
@@ -292,68 +472,30 @@ function hasSoilOverlap(
   return false;
 }
 
+/** Trees occupy 2x2 whatever their art size. Mirrors the client's constant. */
+const TREE_FOOTPRINT = 2;
+
 /**
- * Finds empty 2x2 slots for tree placement. Returns up to `count` non-overlapping top-left positions.
- * Saplings start 1x1 but grow to 2x2, so we reserve 2x2 at placement.
+ * Fixed 2×2 top-lefts for the 3 starter fruit trees on a level-1 (16×24) farm.
+ * Left, right, and bottom-center — keeps the yard open for crops.
  */
-function findEmptyTreeSlots(
+const STARTER_TREE_SLOTS: ReadonlyArray<{ col: number; row: number }> = [
+  { col: 1, row: 6 },
+  { col: 13, row: 6 },
+  { col: 7, row: 20 },
+];
+
+/** Fixed tree slots that still fit and are unoccupied. */
+function resolveStarterTreeSlots(
   placedItems: IPlacedItem[],
   gridCols: number,
   gridRows: number,
-  count: number,
 ): { col: number; row: number }[] {
-  const TREE_SIZE = 2;
-  const occupied = new Set<string>();
-  for (const item of placedItems) {
-    for (let dr = 0; dr < (item.tileRows ?? 1); dr++) {
-      for (let dc = 0; dc < (item.tileCols ?? 1); dc++) {
-        occupied.add(`${item.col + dc}:${item.row + dr}`);
-      }
-    }
-  }
-
-  const candidates: { col: number; row: number }[] = [];
-  for (let row = 0; row + TREE_SIZE <= gridRows; row++) {
-    for (let col = 0; col + TREE_SIZE <= gridCols; col++) {
-      let valid = true;
-      for (let dr = 0; dr < TREE_SIZE && valid; dr++) {
-        for (let dc = 0; dc < TREE_SIZE; dc++) {
-          if (occupied.has(`${col + dc}:${row + dr}`)) {
-            valid = false;
-            break;
-          }
-        }
-      }
-      if (valid) candidates.push({ col, row });
-    }
-  }
-
-  for (let i = candidates.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-  }
-
-  const result: { col: number; row: number }[] = [];
-  const used = new Set<string>();
-  for (const slot of candidates) {
-    if (result.length >= count) break;
-    const key = `${slot.col}:${slot.row}`;
-    if (used.has(key)) continue;
-    let overlaps = false;
-    for (let dr = 0; dr < TREE_SIZE && !overlaps; dr++) {
-      for (let dc = 0; dc < TREE_SIZE; dc++) {
-        if (used.has(`${slot.col + dc}:${slot.row + dr}`)) overlaps = true;
-      }
-    }
-    if (overlaps) continue;
-    result.push(slot);
-    for (let dr = 0; dr < TREE_SIZE; dr++) {
-      for (let dc = 0; dc < TREE_SIZE; dc++) {
-        used.add(`${slot.col + dc}:${slot.row + dr}`);
-      }
-    }
-  }
-  return result;
+  return STARTER_TREE_SLOTS.filter(
+    (slot) =>
+      inBounds(slot.col, slot.row, TREE_FOOTPRINT, TREE_FOOTPRINT, gridCols, gridRows) &&
+      !hasCollision(placedItems, slot.col, slot.row, TREE_FOOTPRINT, TREE_FOOTPRINT),
+  ).map((slot) => ({ col: slot.col, row: slot.row }));
 }
 
 /** Returns true if the footprint fits within grid bounds. */
@@ -371,6 +513,29 @@ function inBounds(col: number, row: number, cols: number, rows: number, gridCols
  * @param placementCols - Override for tile footprint (e.g. tree sapling: 2x2 placement, 1x1 image).
  * @param placementRows - Override for tile footprint.
  */
+
+/**
+ * Spot for Bramble: centered on the house footprint, immediately in front (south).
+ * Falls back to null when there's no house or the footprint is out of bounds.
+ */
+function starterNpcInFrontOfHouse(
+  placed: IPlacedItem[],
+  npcCols: number,
+  npcRows: number,
+  gridCols: number,
+  gridRows: number,
+): { col: number; row: number } | null {
+  const house = placed.find((i) => i.itemType === 'house' && !i.anchorId);
+  if (!house) return null;
+  const houseCols = house.tileCols ?? 6;
+  const houseRows = house.tileRows ?? HOUSE_PLACE_ROWS;
+  const col = house.col + Math.floor((houseCols - npcCols) / 2);
+  const row = house.row + houseRows;
+  if (!inBounds(col, row, npcCols, npcRows, gridCols, gridRows)) return null;
+  if (hasCollision(placed, col, row, npcCols, npcRows)) return null;
+  return { col, row };
+}
+
 function createPlacedTiles(
   def: IGameItemDef,
   col: number,
@@ -403,6 +568,75 @@ function createPlacedTiles(
   return items;
 }
 
+async function ensureHouseItemDef(): Promise<void> {
+  await GameItemDef.updateOne(
+    {
+      itemType: 'house',
+      $or: [{ rows: { $ne: HOUSE_PLACE_ROWS } }, { centerOverflow: { $ne: true } }],
+    },
+    { $set: { rows: HOUSE_PLACE_ROWS, centerOverflow: true } },
+  );
+}
+
+function shiftPlacedItemRows(placed: IPlacedItem[], itemType: string, dy: number): void {
+  if (dy === 0) return;
+  for (const item of placed) {
+    if (item.itemType === itemType) item.row += dy;
+  }
+}
+
+/** Drop extra house tiles so the pad is 2 rows; art overflows the rest. */
+function shrinkHouseToPlaceRows(farm: IFarm): boolean {
+  const anchors = farm.placedItems.filter((i) => i.itemType === 'house' && !i.anchorId);
+  let changed = false;
+  for (const anchor of anchors) {
+    const oldRows = anchor.tileRows ?? 5;
+    if (oldRows <= HOUSE_PLACE_ROWS) continue;
+    const maxRow = anchor.row + HOUSE_PLACE_ROWS;
+    farm.placedItems = farm.placedItems.filter((i) => {
+      const inThis = i.itemType === 'house' && (i.id === anchor.id || i.anchorId === anchor.id);
+      if (!inThis) return true;
+      return i.row < maxRow;
+    });
+    for (const i of farm.placedItems) {
+      if (i.itemType === 'house' && (i.id === anchor.id || i.anchorId === anchor.id)) {
+        i.tileRows = HOUSE_PLACE_ROWS;
+      }
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+/** Move sell/mail to row 0 when they are still on the old centered default (row 1). */
+function pinStarterBoxesToTopRow(farm: IFarm): boolean {
+  let changed = false;
+  for (const type of STARTER_BOX_TYPES) {
+    const anchor = farm.placedItems.find((i) => i.itemType === type && !i.anchorId);
+    if (!anchor || anchor.row === STARTER_YARD_TOP_ROW) continue;
+    if (anchor.row !== 1) continue;
+    shiftPlacedItemRows(farm.placedItems, type, STARTER_YARD_TOP_ROW - anchor.row);
+    changed = true;
+  }
+  return changed;
+}
+
+/** Keep Bramble immediately in front of the house after the footprint shrinks. */
+function snapStarterNpcAfterHouseShrink(farm: IFarm): boolean {
+  const house = farm.placedItems.find((i) => i.itemType === 'house' && !i.anchorId);
+  const npc = farm.placedItems.find((i) => i.itemType === STARTER_NPC_ITEM_TYPE && !i.anchorId);
+  if (!house || !npc) return false;
+  const houseCols = house.tileCols ?? 6;
+  const houseRows = house.tileRows ?? HOUSE_PLACE_ROWS;
+  const npcCols = npc.tileCols ?? 1;
+  const expectedCol = house.col + Math.floor((houseCols - npcCols) / 2);
+  if (npc.col !== expectedCol) return false;
+  const desiredRow = house.row + houseRows;
+  if (npc.row === desiredRow) return false;
+  shiftPlacedItemRows(farm.placedItems, STARTER_NPC_ITEM_TYPE, desiredRow - npc.row);
+  return true;
+}
+
 // ─── Service ────────────────────────────────────────────────────────────────
 
 export const farmService = {
@@ -410,10 +644,11 @@ export const farmService = {
    * Loads the user's farm, creating one with starter inventory if it doesn't exist.
    */
   async loadOrCreateFarm(userId: string): Promise<IFarm> {
+    await ensureHouseItemDef();
     let farm = await Farm.findOne({ userId });
     if (!farm) {
       // Resolve dynamic grid dimensions (scene or level defaults) for new farm
-      const { gridCols, gridRows } = await resolveGridDimensions(userId, 0);
+      const { gridCols, gridRows } = await resolveGridDimensions({ farmLevel: 1 });
       const [houseDef, sellBoxDef, mailBoxDef] = await Promise.all([
         GameItemDef.findOne({ itemType: 'house' }).lean(),
         GameItemDef.findOne({ itemType: 'sell_box' }).lean(),
@@ -426,76 +661,113 @@ export const farmService = {
         starterPlaced.push(...createPlacedTiles(houseDef, houseCol, houseRow));
         if (sellBoxDef) {
           const sellBoxCol = houseCol + houseDef.cols;
-          const sellBoxRow = Math.floor((houseDef.rows - sellBoxDef.rows) / 2);
+          const sellBoxRow = STARTER_YARD_TOP_ROW;
           if (!hasCollision(starterPlaced, sellBoxCol, sellBoxRow, sellBoxDef.cols, sellBoxDef.rows)) {
             starterPlaced.push(...createPlacedTiles(sellBoxDef, sellBoxCol, sellBoxRow));
           }
         }
         if (mailBoxDef) {
           const mailBoxCol = houseCol + houseDef.cols + (sellBoxDef?.cols ?? 2);
-          const mailBoxRow = Math.floor((houseDef.rows - mailBoxDef.rows) / 2);
+          const mailBoxRow = STARTER_YARD_TOP_ROW;
           if (!hasCollision(starterPlaced, mailBoxCol, mailBoxRow, mailBoxDef.cols, mailBoxDef.rows)) {
             starterPlaced.push(...createPlacedTiles(mailBoxDef, mailBoxCol, mailBoxRow));
           }
         }
       }
-      const today = getTodayDateStr();
+      // Starter questline NPC (Bramble) — fixed, centered directly in front of the house.
+      const npcDef = await GameItemDef.findOne({
+        itemType: STARTER_NPC_ITEM_TYPE,
+        category: 'npc',
+      }).lean();
+      if (npcDef) {
+        const spot = starterNpcInFrontOfHouse(
+          starterPlaced,
+          npcDef.cols,
+          npcDef.rows,
+          gridCols,
+          gridRows,
+        );
+        if (spot) {
+          starterPlaced.push(...createPlacedTiles(npcDef, spot.col, spot.row));
+        } else {
+          log.warn({ userId }, 'No free spot for starter NPC in front of house');
+        }
+      }
+
       const treePlantedDateFullyGrown = getDaysAgoDateStr(3); // So advanceTreeGrowth won't regress next day
-      // 5 slots: 3 fruit trees + 2 normal oak trees (all fully grown at start)
-      const treeSlots = findEmptyTreeSlots(starterPlaced, gridCols, gridRows, 5);
+      const treeSlots = resolveStarterTreeSlots(starterPlaced, gridCols, gridRows).slice(0, 3);
       const fruitDefs = await GameItemDef.find({ subCategory: 'fruit' }).lean();
       const fullyGrownFruitTrees = await GameItemDef.find({
         category: 'tree',
         itemType: /^tree_fully_grown_/,
         treeFruit: { $exists: true, $ne: '' },
+        imageUrl: { $exists: true, $nin: [null, ''] },
       }).lean();
-      // Build fruit -> fully_grown type(s)
       const fruitToFullyGrown = new Map<string, string[]>();
       for (const fg of fullyGrownFruitTrees) {
-        if (fg.treeFruit) {
-          const itemType = fg.itemType;
-          const arr = fruitToFullyGrown.get(fg.treeFruit) ?? [];
-          if (!arr.includes(itemType)) arr.push(itemType);
-          fruitToFullyGrown.set(fg.treeFruit, arr);
-        }
+        if (!fg.treeFruit) continue;
+        const arr = fruitToFullyGrown.get(fg.treeFruit) ?? [];
+        if (!arr.includes(fg.itemType)) arr.push(fg.itemType);
+        fruitToFullyGrown.set(fg.treeFruit, arr);
       }
       const eligibleFruits = fruitDefs
         .map((f) => f.itemType)
         .filter((ft) => fruitToFullyGrown.has(ft));
-      // Pick 1 random fruit for the farm; all 3 fruit trees use this variant
-      const chosenFruit = eligibleFruits.length > 0
-        ? eligibleFruits[Math.floor(Math.random() * eligibleFruits.length)]
-        : null;
-      const fullyGrownOptions = chosenFruit ? fruitToFullyGrown.get(chosenFruit)! : [];
-      const fruitTreeType = fullyGrownOptions.length > 0
-        ? fullyGrownOptions[Math.floor(Math.random() * fullyGrownOptions.length)]
-        : null;
 
-      // Place 3 fully grown fruit trees (with 3 fruit each)
-      const fruitCount = Math.min(3, treeSlots.length);
-      if (fruitTreeType && fruitCount > 0) {
-        for (const slot of treeSlots.slice(0, fruitCount)) {
-          const tiles = createTreeTiles(fruitTreeType, slot.col, slot.row, treePlantedDateFullyGrown, 3);
-          starterPlaced.push(...tiles);
+      // 3 fully grown fruit trees, fruit type rolled independently, each with 3 fruit.
+      if (eligibleFruits.length > 0) {
+        for (const slot of treeSlots) {
+          const fruit = eligibleFruits[Math.floor(Math.random() * eligibleFruits.length)];
+          const options = fruitToFullyGrown.get(fruit) ?? [];
+          const fruitTreeType = options[Math.floor(Math.random() * options.length)];
+          if (!fruitTreeType) continue;
+          starterPlaced.push(
+            ...createTreeTiles(fruitTreeType, slot.col, slot.row, treePlantedDateFullyGrown, 3),
+          );
         }
       }
-      // Place 2 fully grown normal oak trees (no fruit, wood only)
-      const oakCount = Math.min(2, Math.max(0, treeSlots.length - 3));
-      const oakPlainType = 'tree_fully_grown_oak_plain';
-      const oakPlainExists = await GameItemDef.findOne({ itemType: oakPlainType }).lean();
-      if (oakPlainExists && oakCount > 0) {
-        for (const slot of treeSlots.slice(3, 3 + oakCount)) {
-          const tiles = createTreeTiles(oakPlainType, slot.col, slot.row, treePlantedDateFullyGrown);
-          starterPlaced.push(...tiles);
-        }
-      }
+      // Day-0 stones & sticks (same counts as daily login).
+      const withPickups = await buildPlacedItemsWithDailyGroundPickups(
+        starterPlaced,
+        gridCols,
+        gridRows,
+      );
+      starterPlaced.splice(0, starterPlaced.length, ...withPickups.items);
+
+      // Day-0 dig spots — same count as daily login. Seeded here so farm reset
+      // and brand-new farms have them even before the client hits daily-login.
+      const withFossils = await appendFossilHoles(starterPlaced, gridCols, gridRows);
+      starterPlaced.splice(0, starterPlaced.length, ...withFossils.items);
+
       farm = await Farm.create({
         userId,
         inventory: new Map(Object.entries(STARTER_INVENTORY)),
         placedItems: starterPlaced,
       });
       log.info({ userId }, 'Created new farm with house');
+      await ensureStarterCraftingRecipes(userId);
+      await syncCraftingRecipesThroughLevel(userId, await getUserSkillLevel(userId, 'crafting'));
+      await syncCookingRecipesThroughLevel(userId, await getUserSkillLevel(userId, 'cooking'));
+      await syncFarmingSoilThroughLevel(userId, await getUserSkillLevel(userId, 'farming'));
     } else {
+      // Backfill starter recipes for farms created before stick-tool defaults existed.
+      await ensureStarterCraftingRecipes(userId);
+      // Catch-up: grant any crafting-level recipes the player already qualifies for.
+      await syncCraftingRecipesThroughLevel(userId, await getUserSkillLevel(userId, 'crafting'));
+      // Catch-up: cooking-level recipes (every 2 levels).
+      await syncCookingRecipesThroughLevel(userId, await getUserSkillLevel(userId, 'cooking'));
+      // Catch-up: farming soil milestones (idempotent via farm watermark).
+      await syncFarmingSoilThroughLevel(userId, await getUserSkillLevel(userId, 'farming'));
+
+      // Repair farms corrupted by ground-pickup clear (Mongoose length=0 left dups).
+      const deduped = dedupePlacedItemsById(farm.placedItems);
+      if (deduped.removed > 0) {
+        farm.placedItems = deduped.items;
+        farm.markModified('placedItems');
+        await farm.save();
+        log.warn({ userId, removed: deduped.removed }, 'Removed duplicate placedItems by id');
+      }
+
       // Backfill: fully grown fruit trees that have never been harvested should show 3 fruit
       const itemDefsMap = await loadItemDefsMap();
       let fruitBackfill = false;
@@ -524,7 +796,7 @@ export const farmService = {
       if (!hasHouse && !hasHouseInv) {
         const houseDef = await GameItemDef.findOne({ itemType: 'house' }).lean();
         if (houseDef) {
-          const { gridCols } = await resolveGridDimensions(userId, farm.xp);
+          const { gridCols } = await resolveGridDimensions(farm);
           const houseCol = Math.floor((gridCols - houseDef.cols) / 2);
           const houseRow = 0;
           const houseTiles = createPlacedTiles(houseDef, houseCol, houseRow);
@@ -540,6 +812,58 @@ export const farmService = {
           log.info({ userId, placed: !blocked }, 'Backfilled house for existing farm');
         }
       }
+
+      const shrunkHouse = shrinkHouseToPlaceRows(farm);
+      const pinnedBoxes = pinStarterBoxesToTopRow(farm);
+      const snappedNpc = snapStarterNpcAfterHouseShrink(farm);
+      if (shrunkHouse || pinnedBoxes || snappedNpc) {
+        farm.markModified('placedItems');
+        await farm.save();
+        log.info({ userId }, 'Backfilled house footprint and top-row starter boxes');
+      }
+
+      // Backfill starter NPC after farm reset / older farms that never had him.
+      // Once his last quest is done he leaves — don't put him back, and send
+      // him away if he is still sitting on a finished farm.
+      const hasStarterNpc = farm.placedItems.some((i) => i.itemType === STARTER_NPC_ITEM_TYPE);
+      const npcDeparted = await UserQuest.exists({
+        userId,
+        questId: STARTER_NPC_DEPARTURE_QUEST_ID,
+        status: 'completed',
+      });
+      if (npcDeparted) {
+        if (hasStarterNpc) {
+          const gone = farm.placedItems.filter((i) => i.itemType === STARTER_NPC_ITEM_TYPE).map((i) => i.id);
+          const goneSet = new Set(gone);
+          farm.placedItems = farm.placedItems.filter((i) => !goneSet.has(i.id));
+          farm.markModified('placedItems');
+          await farm.save();
+          log.info({ userId, removed: gone.length }, 'Removed starter NPC after questline');
+        }
+      } else if (!hasStarterNpc) {
+        const npcDef = await GameItemDef.findOne({
+          itemType: STARTER_NPC_ITEM_TYPE,
+          category: 'npc',
+        }).lean();
+        if (npcDef) {
+          const { gridCols, gridRows } = await resolveGridDimensions(farm);
+          const spot = starterNpcInFrontOfHouse(
+            farm.placedItems,
+            npcDef.cols,
+            npcDef.rows,
+            gridCols,
+            gridRows,
+          );
+          if (spot) {
+            farm.placedItems.push(...createPlacedTiles(npcDef, spot.col, spot.row));
+            farm.markModified('placedItems');
+            await farm.save();
+            log.info({ userId, ...spot }, 'Backfilled starter NPC in front of house');
+          } else {
+            log.warn({ userId }, 'No free spot to backfill starter NPC in front of house');
+          }
+        }
+      }
     }
     return farm;
   },
@@ -550,26 +874,22 @@ export const farmService = {
   async getSnapshot(userId: string): Promise<GameSnapshot> {
     const farm = await this.loadOrCreateFarm(userId);
     const itemDefs = await loadItemDefsMap();
-    const level = await resolveFarmLevel(userId, farm.xp);
+    const level = farmLevelOf(farm);
 
-    const { gridCols, gridRows } = await resolveGridDimensions(userId, farm.xp);
+    const { gridCols, gridRows } = await resolveGridDimensions(farm);
 
     const sceneSlug = `farm_${level.cols}x${level.rows}`;
 
-    // Ensure quest records exist first, then fetch quests + dialogs + scene in parallel
-    await questService.ensureUserQuests(userId);
-    const [sceneryRecord, quests, canUpgrade, pendingDialogs, scene] = await Promise.all([
+    const [sceneryRecord, questSync, scene] = await Promise.all([
       BakedScenery.findOne({ farmCols: gridCols, farmRows: gridRows }).lean(),
-      questService.getQuestsForUser(userId),
-      questService.canUpgradeFarm(userId, level.level),
-      questService.getPendingDialogs(userId),
+      questService.sync(userId),
       Scene.findOne({ slug: sceneSlug }).select('cols rows bakedImageUrl placements').lean(),
     ]);
 
     let sceneryUrl = sceneryRecord?.imageUrl;
     let sceneWorldCols: number | undefined;
     let sceneWorldRows: number | undefined;
-    let scenePlacements: Array<{ id: string; itemType: string; x: number; y: number; scale: number; depthOffset?: number }> | undefined;
+    let scenePlacements: ScenePlacementSnapshot[] | undefined;
 
     if (scene?.bakedImageUrl) {
       sceneryUrl = scene.bakedImageUrl;
@@ -581,7 +901,13 @@ export const farmService = {
         x: p.x,
         y: p.y,
         scale: p.scale ?? 1,
+        scaleX: p.scaleX,
+        scaleY: p.scaleY,
         depthOffset: p.depthOffset,
+        rotationDegrees: p.rotationDegrees,
+        flipX: p.flipX,
+        flipY: p.flipY,
+        live: p.live,
       })) : undefined;
       log.info({ userId, sceneSlug, sceneWorldCols, sceneWorldRows, placementCount: scenePlacements?.length ?? 0 }, 'Snapshot: using scene baked scenery');
     } else if (sceneryRecord?.imageUrl) {
@@ -606,13 +932,23 @@ export const farmService = {
       ? { col: petEntry.col, row: petEntry.row, behavior: petEntry.state }
       : { col: spawnCol, row: spawnRow, behavior: 'idle' as const };
 
+    const backpackSlots = await syncBackpackSlotsFromCrafting(userId, farm);
+    const mining = await syncMiningEnergy(userId, farm);
+    if (farm.isModified('backpackSlots') || farm.isModified('miningEnergy') || farm.isModified('miningEnergyAt')) {
+      await farm.save();
+    }
+
     return {
       farmName: farm.name,
-      farmXp: farm.xp,
-      gems: farm.gems,
-      farmLevel: level.level,
+      // A quest can finish during the sync above, so prefer its fresher numbers.
+      farmXp: questSync.farmXp ?? farm.xp,
+      gems: questSync.gems ?? farm.gems,
+      farmLevel: questSync.farmLevel,
       farmLevels: FARM_LEVELS,
-      inventory: inventoryToRecord(farm.inventory),
+      inventory: questSync.inventory ?? inventoryToRecord(farm.inventory),
+      storage: inventoryToRecord(farm.storage ?? new Map()),
+      backpackSlots,
+      ...miningEnergyStateUpdate(mining),
       placedItems: farm.placedItems.map(toPlacedSnapshot),
       equipped: equipped && Object.keys(equipped).length > 0 ? equipped : undefined,
       foodDishQueues: farm.foodDishQueues && Object.keys(farm.foodDishQueues).length > 0 ? farm.foodDishQueues : undefined,
@@ -624,9 +960,10 @@ export const farmService = {
       sceneWorldCols,
       sceneWorldRows,
       scenePlacements,
-      quests,
-      canUpgrade,
-      pendingDialogs: pendingDialogs.length > 0 ? pendingDialogs : undefined,
+      quests: questSync.quests,
+      canUpgrade: questSync.canUpgrade,
+      questDialogs: questSync.dialogs.length > 0 ? questSync.dialogs : undefined,
+      weather: weatherService.getActiveWeather(),
     };
   },
 
@@ -635,7 +972,7 @@ export const farmService = {
    */
   async getGridDimensions(userId: string): Promise<{ gridCols: number; gridRows: number }> {
     const farm = await this.loadOrCreateFarm(userId);
-    return resolveGridDimensions(userId, farm.xp);
+    return resolveGridDimensions(farm);
   },
 
   /**
@@ -652,8 +989,8 @@ export const farmService = {
   }> {
     const farm = await this.loadOrCreateFarm(userId);
     const itemDefs = await loadItemDefsMap();
-    const level = await resolveFarmLevel(userId, farm.xp);
-    const { gridCols, gridRows } = await resolveGridDimensions(userId, farm.xp);
+    const level = farmLevelOf(farm);
+    const { gridCols, gridRows } = await resolveGridDimensions(farm);
     return {
       placedItems: farm.placedItems,
       foodDishQueues: farm.foodDishQueues,
@@ -681,13 +1018,21 @@ export const farmService = {
     if (!def.placeable) throw new Error(`Item ${itemType} is not placeable`);
     if (def.category === 'food') throw new Error('Food cannot be placed; use a food dish instead');
 
-    const { gridCols, gridRows } = await resolveGridDimensions(userId, farm.xp);
+    const { gridCols, gridRows } = await resolveGridDimensions(farm);
     const qty = farm.inventory.get(itemType) ?? 0;
     if (qty <= 0) throw new Error(`No ${itemType} in inventory`);
-    if (!inBounds(col, row, def.cols, def.rows, gridCols, gridRows)) throw new Error('Placement out of bounds');
 
     const isSeed = def.category === 'seed';
     const isSoil = def.category === 'soil';
+    const isTree = def.category === 'tree';
+    // A tree occupies 2x2 however big its art is. Checking bounds against the
+    // art size rejected edge placements the client had already accepted, which
+    // left the client holding an item the server never placed.
+    const footCols = isTree ? TREE_FOOTPRINT : def.cols;
+    const footRows = isTree ? TREE_FOOTPRINT : def.rows;
+    if (!inBounds(col, row, footCols, footRows, gridCols, gridRows)) {
+      throw new Error('Placement out of bounds');
+    }
 
     if (isSoil) {
       const itemDefsMap = await loadItemDefsMap();
@@ -718,21 +1063,16 @@ export const farmService = {
       }
     }
 
-    const isTree = def.category === 'tree';
-    const treePlacementCols = isTree ? 2 : (def.cols ?? 1);
-    const treePlacementRows = isTree ? 2 : (def.rows ?? 1);
     if (isTree) {
-      if (hasCollision(farm.placedItems, col, row, treePlacementCols, treePlacementRows)) {
-        throw new Error('Trees need a clear area');
-      }
-      if (!inBounds(col, row, treePlacementCols, treePlacementRows, gridCols, gridRows)) {
-        throw new Error('Tree placement out of bounds');
+      const itemDefsMap = await loadItemDefsMap();
+      if (hasTreeConflict(farm.placedItems, itemDefsMap, col, row, footCols, footRows)) {
+        throw new Error("Trees can't be placed on another tree or on planting soil");
       }
     }
 
-    const currentLvl = await resolveFarmLevel(userId, farm.xp);
+    const currentLvl = farmLevelOf(farm);
     const newItems = isTree
-      ? createPlacedTiles(def, col, row, 2, 2)
+      ? createPlacedTiles(def, col, row, TREE_FOOTPRINT, TREE_FOOTPRINT)
       : createPlacedTiles(def, col, row);
     if (isTree) {
       const today = getTodayDateStr();
@@ -756,6 +1096,11 @@ export const farmService = {
 
     log.info({ userId, itemType, col, row }, 'Item placed');
 
+    const skillGrant =
+      def.category === 'seed' || def.category === 'soil'
+        ? await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_place)
+        : null;
+
     // Raise pet mood when planting crops or placing decorations
     let pet: PublicPet | undefined;
     if (def.category === 'seed' || def.category === 'decoration') {
@@ -763,26 +1108,18 @@ export const farmService = {
       if (updated) pet = updated;
     }
 
-    // Track action + auto-complete eligible quests + refresh
-    await questService.trackAction(userId, 'place', itemType);
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvlAfter = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'place', itemType });
 
-    const update: StateUpdate = {
-      farmXp: freshFarm.xp,
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      addedItems: newItems.map(toPlacedSnapshot),
-      quests,
-      farmLevel: lvlAfter.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvlAfter.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-      ...(pet && { pet }),
-    };
-
-    return update;
+    return attachSkillXp(
+      withQuestSync({
+        farmXp: farm.xp,
+        gems: farm.gems,
+        inventory: inventoryToRecord(farm.inventory),
+        addedItems: newItems.map(toPlacedSnapshot),
+        ...(pet && { pet }),
+      }, sync),
+      skillGrant,
+    );
   },
 
   /**
@@ -803,41 +1140,48 @@ export const farmService = {
     );
     if (toRemove.length === 0) throw new Error('No tiles found for item');
 
+    const def = await GameItemDef.findOne({ itemType: target.itemType }).lean();
+    if (def?.category === 'npc') throw new Error("NPCs can't be stored");
+
+    if (!opts?.consume) {
+      await syncBackpackSlotsFromCrafting(userId, farm);
+      if (!canFitInBackpack(farm, target.itemType)) {
+        const max = getBackpackSlots(farm);
+        throw new Error(`Backpack full (${max}/${max} slots). Store items first.`);
+      }
+    }
+
     const removeIds = new Set(toRemove.map((i) => i.id));
     farm.placedItems = farm.placedItems.filter((i) => !removeIds.has(i.id));
 
     if (!opts?.consume) {
-      const currentQty = farm.inventory.get(target.itemType) ?? 0;
-      farm.inventory.set(target.itemType, currentQty + 1);
+      addToBackpack(farm, target.itemType, 1);
       awardXp(farm, FARM_XP_REWARDS.remove);
-      farm.markModified('inventory');
     }
     farm.markModified('placedItems');
     await farm.save();
 
+    const skillGrant = !opts?.consume
+      ? await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_remove)
+      : null;
+
     log.info({ userId, itemId, itemType: target.itemType, consume: opts?.consume }, 'Item removed');
 
-    // Track action + auto-complete eligible quests + refresh (skip for consumed items)
-    if (!opts?.consume) {
-      await questService.trackAction(userId, 'remove', target.itemType);
-    }
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    // Consuming an item (the pet eating) isn't the player removing something.
+    const sync = opts?.consume
+      ? await questService.sync(userId)
+      : await questService.recordEvents(userId, { kind: 'action', action: 'remove', itemType: target.itemType });
 
-    const update: StateUpdate = {
-      farmXp: freshFarm.xp,
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      removedItemIds: [...removeIds],
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-    };
-
-    return update;
+    return attachSkillXp(
+      withQuestSync({
+        farmXp: farm.xp,
+        gems: farm.gems,
+        inventory: inventoryToRecord(farm.inventory),
+        removedItemIds: [...removeIds],
+        backpackSlots: getBackpackSlots(farm),
+      }, sync),
+      skillGrant,
+    );
   },
 
   /**
@@ -864,45 +1208,37 @@ export const farmService = {
     const removeIds = new Set(toRemove.map((i) => i.id));
     farm.placedItems = farm.placedItems.filter((i) => !removeIds.has(i.id));
 
-    for (const drop of def.harvestYield) {
-      const current = farm.inventory.get(drop.itemType) ?? 0;
-      farm.inventory.set(drop.itemType, current + drop.qty);
-    }
+    const farmingLevel = await getUserSkillLevel(userId, 'farming');
+    const extraYield = grantCropHarvestLoot(farm, target.itemType, def.harvestYield, farmingLevel);
 
     awardXp(farm, FARM_XP_REWARDS.harvest);
     farm.markModified('inventory');
     farm.markModified('placedItems');
     await farm.save();
 
-    log.info({ userId, itemId, itemType: target.itemType, yields: def.harvestYield }, 'Crop harvested');
+    const skillGrant = await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_harvest);
 
-    // Track harvest for the seed type AND each yielded item type
-    const trackTypes = new Set<string>([target.itemType]);
-    for (const drop of def.harvestYield) trackTypes.add(drop.itemType);
-    for (const t of trackTypes) {
-      await questService.trackAction(userId, 'harvest', t);
-    }
-    // Track crop_grown (crop reached harvestable state) for the harvested crop type
-    await questService.trackCropGrown(userId, target.itemType);
+    log.info({ userId, itemId, itemType: target.itemType, yields: extraYield }, 'Crop harvested');
 
-    // Auto-complete eligible quests + refresh
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    // A harvest counts for the crop that was planted and for everything it yielded,
+    // so authors can ask for either "harvest wheat_seed" or "harvest wheat".
+    const harvested = new Set<string>([target.itemType, ...extraYield]);
+    const sync = await questService.recordEvents(
+      userId,
+      ...[...harvested].map((itemType) => ({ kind: 'action' as const, action: 'harvest', itemType })),
+      { kind: 'crop_grown', itemType: target.itemType },
+    );
 
-    const update: StateUpdate = {
-      farmXp: freshFarm.xp,
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      removedItemIds: [...removeIds],
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-    };
-
-    return update;
+    return attachSkillXp(
+      withQuestSync({
+        farmXp: farm.xp,
+        gems: farm.gems,
+        inventory: inventoryToRecord(farm.inventory),
+        storage: inventoryToRecord(farm.storage ?? new Map()),
+        removedItemIds: [...removeIds],
+      }, sync),
+      skillGrant,
+    );
   },
 
   /**
@@ -938,8 +1274,9 @@ export const farmService = {
     const anchId = target.anchorId ?? target.id;
     const def = await GameItemDef.findOne({ itemType: target.itemType }).lean();
     if (!def) throw new Error(`Unknown item type: ${target.itemType}`);
+    if (def.category === 'npc') throw new Error("NPCs can't be moved");
 
-    const { gridCols, gridRows } = await resolveGridDimensions(userId, farm.xp);
+    const { gridCols, gridRows } = await resolveGridDimensions(farm);
     if (!inBounds(newCol, newRow, def.cols, def.rows, gridCols, gridRows)) throw new Error('Move destination out of bounds');
 
     const anchorItem = farm.placedItems.find((i) => i.id === anchId) ?? target;
@@ -955,8 +1292,12 @@ export const farmService = {
     if (!inBounds(newCol, newRow, moveCols, moveRows, gridCols, gridRows)) {
       throw new Error('Move destination out of bounds');
     }
-    if (hasCollision(farm.placedItems, newCol, newRow, moveCols, moveRows, anchId)) {
-      throw new Error(isTree ? 'Trees need a clear area' : 'Destination overlaps another item');
+    // Items are free to overlap; only trees and soil have placement rules.
+    if (isTree) {
+      const itemDefsMap = await loadItemDefsMap();
+      if (hasTreeConflict(farm.placedItems, itemDefsMap, newCol, newRow, moveCols, moveRows, anchId)) {
+        throw new Error("Trees can't be placed on another tree or on planting soil");
+      }
     }
 
     if (def.category === 'soil') {
@@ -1032,69 +1373,95 @@ export const farmService = {
     farm.markModified('placedItems');
     await farm.save();
 
+    const skillGrant = await skillXpService.grant(userId, 'farming', SKILL_XP_REWARDS.farm_water);
+
     const wateredTiles = farm.placedItems.filter(
       (i) => i.id === anchId || i.anchorId === anchId,
     );
 
     log.info({ userId, col, row, itemType: target.itemType }, 'Tile watered');
 
-    await questService.trackAction(userId, 'water', target.itemType);
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'water', itemType: target.itemType });
 
-    const update: StateUpdate = {
-      farmXp: freshFarm.xp,
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      addedItems: wateredTiles.map(toPlacedSnapshot),
-      removedItemIds: wateredTiles.map((i) => i.id),
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-    };
-
-    return update;
+    return attachSkillXp(
+      withQuestSync({
+        farmXp: farm.xp,
+        gems: farm.gems,
+        inventory: inventoryToRecord(farm.inventory),
+        addedItems: wateredTiles.map(toPlacedSnapshot),
+        removedItemIds: wateredTiles.map((i) => i.id),
+      }, sync),
+      skillGrant,
+    );
   },
 
   /**
    * Purchases an item from the shop using gems.
+   * Server is the failsafe: buyable, price, stock window, and level gates
+   * are all re-checked here regardless of what the client shows.
    */
   async purchaseItem(userId: string, itemType: string): Promise<StateUpdate> {
     const def = await GameItemDef.findOne({ itemType }).lean();
     if (!def) throw new Error(`Unknown item type: ${itemType}`);
     if (!def.buyable) throw new Error('This item is not for sale');
+    const isRecipeScroll =
+      def.subCategory === 'crafting_recipe' || def.subCategory === 'cooking_recipe';
+    if (def.category === 'material' && !isRecipeScroll) throw new Error('This item is not for sale');
     if (!def.gemPrice || def.gemPrice <= 0) throw new Error('Item has no price set');
+    if (def.availableUntil && new Date(def.availableUntil).getTime() <= Date.now()) {
+      throw new Error('This item is no longer available');
+    }
 
     const farm = await this.loadOrCreateFarm(userId);
-    if (farm.gems < def.gemPrice) throw new Error('Not enough gems');
+    const farmLvl = farm.farmLevel ?? 1;
+    const requiredFarm = def.farmLevel ?? 0;
+    if (requiredFarm > 0 && farmLvl < requiredFarm) {
+      throw new Error(`Requires farm level ${requiredFarm}`);
+    }
 
-    farm.gems -= def.gemPrice;
-    const current = farm.inventory.get(itemType) ?? 0;
-    farm.inventory.set(itemType, current + 1);
-    farm.markModified('inventory');
+    const requiredPet = def.petLevel ?? 0;
+    const requiredFarming = def.farmingSkillLevel ?? 0;
+    if (requiredPet > 0 || requiredFarming > 0) {
+      const user = await User.findById(userId).select('pet.level skills.farming.level').lean();
+      if (requiredPet > 0) {
+        const petLvl = user?.pet?.level ?? 0;
+        if (petLvl < requiredPet) {
+          throw new Error(`Requires pet level ${requiredPet}`);
+        }
+      }
+      if (requiredFarming > 0) {
+        const farmingLvl = user?.skills?.farming?.level ?? 0;
+        if (farmingLvl < requiredFarming) {
+          throw new Error(`Requires farming skill level ${requiredFarming}`);
+        }
+      }
+    }
+
+    const currency = typeof def.shopCurrency === 'string' ? def.shopCurrency.trim() : '';
+    if (currency) {
+      const currencyDef = await GameItemDef.findOne({ itemType: currency }).lean();
+      const label = currencyDef?.label ?? currency;
+      const have = farm.inventory.get(currency) ?? 0;
+      if (have < def.gemPrice) throw new Error(`Not enough ${label}`);
+      takeFromBackpack(farm, currency, def.gemPrice);
+    } else {
+      if (farm.gems < def.gemPrice) throw new Error('Not enough gems');
+      farm.gems -= def.gemPrice;
+    }
+    addToBackpack(farm, itemType, 1);
     await farm.save();
 
-    log.info({ userId, itemType, cost: def.gemPrice, remaining: farm.gems }, 'Item purchased');
+    log.info(
+      { userId, itemType, cost: def.gemPrice, currency: currency || 'gems', remaining: farm.gems },
+      'Item purchased',
+    );
 
-    await questService.trackAction(userId, 'purchase', itemType);
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvl = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'purchase', itemType });
 
-    const update: StateUpdate = {
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-    };
-
-    return update;
+    return withQuestSync({
+      gems: farm.gems,
+      inventory: inventoryToRecord(farm.inventory),
+    }, sync);
   },
 
   /**
@@ -1123,18 +1490,12 @@ export const farmService = {
 
     log.info({ userId, itemType, qty: sellQty, gems: totalGems, remaining: farm.gems }, 'Item sold');
 
-    const lvl = await resolveFarmLevel(userId, farm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, { kind: 'action', action: 'sell', itemType, count: sellQty });
 
-    const update: StateUpdate = {
+    return withQuestSync({
       gems: farm.gems,
       inventory: inventoryToRecord(farm.inventory),
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-    };
-
-    return update;
+    }, sync);
   },
 
   /**
@@ -1150,6 +1511,7 @@ export const farmService = {
     const farm = await this.loadOrCreateFarm(userId);
     const defsMap = await loadItemDefsMap();
     let totalGems = 0;
+    const sold: QuestEvent[] = [];
 
     for (const { itemType, qty } of items) {
       if (qty <= 0) continue;
@@ -1164,6 +1526,7 @@ export const farmService = {
       const newQty = current - sellQty;
       if (newQty <= 0) farm.inventory.delete(itemType);
       else farm.inventory.set(itemType, newQty);
+      sold.push({ kind: 'action', action: 'sell', itemType, count: sellQty });
     }
 
     farm.gems += totalGems;
@@ -1172,16 +1535,12 @@ export const farmService = {
 
     log.info({ userId, itemCount: items.length, totalGems }, 'Items sold (batch)');
 
-    const lvl = await resolveFarmLevel(userId, farm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, ...sold);
 
-    return {
+    return withQuestSync({
       gems: farm.gems,
       inventory: inventoryToRecord(farm.inventory),
-      quests,
-      farmLevel: lvl.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvl.level),
-    };
+    }, sync);
   },
 
   /**
@@ -1246,7 +1605,7 @@ export const farmService = {
   ): Promise<StateUpdate> {
     const farm = await this.loadOrCreateFarm(userId);
     const itemDefsMap = await loadItemDefsMap();
-    const level = await resolveFarmLevel(userId, farm.xp);
+    const level = farmLevelOf(farm);
     const maxQueueSize = getMaxFoodDishQueueSize(level.level);
 
     const placed = farm.placedItems.find((i) => i.id === anchorId || i.anchorId === anchorId);
@@ -1337,12 +1696,14 @@ export const farmService = {
 
     const farm = await this.loadOrCreateFarm(userId);
     const defsMap = await loadItemDefsMap();
-    const { gridCols, gridRows } = await resolveGridDimensions(userId, farm.xp);
+    const farmingLevel = await getUserSkillLevel(userId, 'farming');
+    const { gridCols, gridRows } = await resolveGridDimensions(farm);
     const failedOps: number[] = [];
     const allAdded: IPlacedItem[] = [];
     const allRemovedIds: string[] = [];
     const trackActions: { action: string; itemType: string }[] = [];
     let totalXp = 0;
+    let skillFarmXp = 0;
 
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
@@ -1377,6 +1738,7 @@ export const farmService = {
           farm.inventory.set(op.itemType, qty - 1);
           allAdded.push(...newItems);
           totalXp += FARM_XP_REWARDS.place;
+          skillFarmXp += SKILL_XP_REWARDS.farm_place;
           trackActions.push({ action: 'place', itemType: op.itemType });
         } else if (op.type === 'water') {
           const target = farm.placedItems.find(
@@ -1393,6 +1755,7 @@ export const farmService = {
               item.plantedAt = target.plantedAt;
             }
           }
+          skillFarmXp += SKILL_XP_REWARDS.farm_water;
           trackActions.push({ action: 'water', itemType: target.itemType });
         } else if (op.type === 'harvest') {
           const target = farm.placedItems.find((it) => it.id === op.anchorId);
@@ -1415,15 +1778,15 @@ export const farmService = {
           const removeSet = new Set(removeIds);
           farm.placedItems = farm.placedItems.filter((it) => !removeSet.has(it.id));
 
-          for (const drop of def.harvestYield) {
-            const current = farm.inventory.get(drop.itemType) ?? 0;
-            farm.inventory.set(drop.itemType, current + drop.qty);
-          }
+          const extraYield = grantCropHarvestLoot(farm, target.itemType, def.harvestYield, farmingLevel);
 
           totalXp += FARM_XP_REWARDS.harvest;
+          skillFarmXp += SKILL_XP_REWARDS.farm_harvest;
           trackActions.push({ action: 'harvest', itemType: target.itemType });
-          for (const drop of def.harvestYield) {
-            trackActions.push({ action: 'harvest', itemType: drop.itemType });
+          for (const itemType of extraYield) {
+            if (itemType !== target.itemType) {
+              trackActions.push({ action: 'harvest', itemType });
+            }
           }
         }
       } catch {
@@ -1438,46 +1801,42 @@ export const farmService = {
     farm.markModified('placedItems');
     await farm.save();
 
+    const skillGrant =
+      skillFarmXp > 0 ? await skillXpService.grant(userId, 'farming', skillFarmXp) : null;
+
     log.info({ userId, opCount: ops.length, failed: failedOps.length }, 'Crop batch processed');
 
-    // Track quest actions (parallelized) — count occurrences for batch harvest/plant
+    // Roll the batch up into one event per action+item pair. These used to be
+    // fired in parallel, and concurrent saves of the same quest row lost counts.
     const actionCounts = new Map<string, Map<string, number>>();
     for (const ta of trackActions) {
       if (!actionCounts.has(ta.action)) actionCounts.set(ta.action, new Map());
       const itemMap = actionCounts.get(ta.action)!;
       itemMap.set(ta.itemType, (itemMap.get(ta.itemType) ?? 0) + 1);
     }
-    const trackPromises: Promise<unknown>[] = [];
+
+    const events: QuestEvent[] = [];
     for (const [action, itemMap] of actionCounts) {
       for (const [itemType, count] of itemMap) {
-        trackPromises.push(questService.trackAction(userId, action, itemType, count));
+        events.push({ kind: 'action', action, itemType, count });
+        if (action === 'harvest') events.push({ kind: 'crop_grown', itemType, count });
       }
     }
-    const harvestCounts = actionCounts.get('harvest');
-    if (harvestCounts) {
-      for (const [itemType, count] of harvestCounts) {
-        trackPromises.push(questService.trackCropGrown(userId, itemType, count));
-      }
-    }
-    await Promise.all(trackPromises);
 
-    const autoCompleted = await questService.autoCompleteEligibleQuests(userId);
-    const freshFarm = autoCompleted.length > 0 ? await this.loadOrCreateFarm(userId) : farm;
-    const lvlAfter = await resolveFarmLevel(userId, freshFarm.xp);
-    const quests = await questService.getQuestsForUser(userId);
+    const sync = await questService.recordEvents(userId, ...events);
 
     // Build the watered items list for addedItems (deduplicated by ID)
     const wateredAddedMap = new Map<string, IPlacedItem>();
     const wateredRemovedIdSet = new Set<string>();
     for (const op of ops) {
       if (op.type !== 'water') continue;
-      const directHit = freshFarm.placedItems.find(
+      const directHit = farm.placedItems.find(
         (d) => d.col === op.col && d.row === op.row && !!d.growthMs,
       );
       if (!directHit) continue;
 
       const aId = directHit.anchorId ?? directHit.id;
-      const siblings = freshFarm.placedItems.filter(
+      const siblings = farm.placedItems.filter(
         (it) => it.id === aId || it.anchorId === aId,
       );
       for (const it of siblings) {
@@ -1500,23 +1859,75 @@ export const farmService = {
       if (updated) pet = updated;
     }
 
-    const update: StateUpdate & { failedOps?: number[] } = {
-      farmXp: freshFarm.xp,
-      gems: freshFarm.gems,
-      inventory: inventoryToRecord(freshFarm.inventory),
-      addedItems: Array.from(addedMap.values()),
-      removedItemIds: Array.from(finalRemovedIds),
-      quests,
-      farmLevel: lvlAfter.level,
-      canUpgrade: await questService.canUpgradeFarm(userId, lvlAfter.level),
-      autoCompletedQuests: autoCompleted.length > 0 ? autoCompleted : undefined,
-      ...(pet && { pet }),
-      ...(failedOps.length > 0 && { failedOps }),
-    };
-
-    return update;
+    return attachSkillXp(
+      withQuestSync(
+        {
+          farmXp: farm.xp,
+          gems: farm.gems,
+          inventory: inventoryToRecord(farm.inventory),
+          addedItems: Array.from(addedMap.values()),
+          removedItemIds: Array.from(finalRemovedIds),
+          ...(pet && { pet }),
+          ...(failedOps.length > 0 && { failedOps }),
+        },
+        sync,
+      ) as StateUpdate & { failedOps?: number[] },
+      skillGrant,
+    );
   },
 
-  /** Resolves effective farm level (used by admin routes). */
-  resolveFarmLevel,
+  /**
+   * Move items from backpack → farm storage (uncapped vault).
+   */
+  async depositToStorage(
+    userId: string,
+    items: Array<{ itemType: string; qty: number }>,
+  ): Promise<StateUpdate> {
+    const farm = await this.loadOrCreateFarm(userId);
+    for (const { itemType, qty } of items) {
+      if (!itemType || qty <= 0) continue;
+      takeFromBackpack(farm, itemType, qty);
+      addToStorage(farm, itemType, qty);
+    }
+    const backpackSlots = await syncBackpackSlotsFromCrafting(userId, farm);
+    await farm.save();
+    log.info({ userId, items }, 'Deposited to storage');
+    return {
+      inventory: inventoryToRecord(farm.inventory),
+      storage: inventoryToRecord(farm.storage ?? new Map()),
+      backpackSlots,
+    };
+  },
+
+  /**
+   * Move items from storage → backpack (respects backpack slot cap).
+   */
+  async withdrawFromStorage(
+    userId: string,
+    items: Array<{ itemType: string; qty: number }>,
+  ): Promise<StateUpdate> {
+    const farm = await this.loadOrCreateFarm(userId);
+    const backpackSlots = await syncBackpackSlotsFromCrafting(userId, farm);
+    for (const { itemType, qty } of items) {
+      if (!itemType || qty <= 0) continue;
+      takeFromStorage(farm, itemType, qty);
+      try {
+        addToBackpack(farm, itemType, qty);
+      } catch (err) {
+        // Roll back this item's storage take by putting it back.
+        addToStorage(farm, itemType, qty);
+        throw err;
+      }
+    }
+    await farm.save();
+    log.info({ userId, items }, 'Withdrew from storage');
+    return {
+      inventory: inventoryToRecord(farm.inventory),
+      storage: inventoryToRecord(farm.storage ?? new Map()),
+      backpackSlots,
+    };
+  },
+
+  farmLevelOf,
+  farmLevelByNumber,
 };

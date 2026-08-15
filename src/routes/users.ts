@@ -8,10 +8,22 @@ import { createLogger } from '../config/logger.js';
 import { OnboardingProfile } from '../models/OnboardingProfile.js';
 import { WeightLog } from '../models/WeightLog.js';
 import { User } from '../models/User.js';
-import { Subscription } from '../models/Subscription.js';
 import { PushToken } from '../models/PushToken.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { checkAndGrant } from '../services/DailyLoginService.js';
+import mongoose from 'mongoose';
+import { Friend } from '../models/Friend.js';
+import { Farm } from '../models/Farm.js';
+import {
+  createDefaultSkills,
+  ensureUserSkills,
+  syncPetTotalLevelFromSkills,
+  toPublicSkills,
+  totalSkillLevel,
+} from '../services/SkillXpService.js';
+import { multiplayerManager } from '../services/MultiplayerManager.js';
+import { isStressBot } from '../services/stressBotIds.js';
+import { UserEntity } from '../entities/UserEntity.js';
 
 const log = createLogger('UsersRoute');
 const router = Router();
@@ -100,7 +112,7 @@ router.post(
 // ─── GET /users/me ──────────────────────────────────────────────────────────
 
 /**
- * Returns the authenticated user's public profile.
+ * Returns the authenticated user's public profile (includes skills + average pet level).
  */
 router.get(
   '/me',
@@ -108,25 +120,7 @@ router.get(
   catchAsync(async (req, res) => {
     const user = req.user;
     if (!user) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
-
-    const sub = await Subscription.findOne({ userId: user.id });
-    const subscription = sub
-      ? { status: sub.status, plan: sub.plan, currentPeriodEnd: sub.currentPeriodEnd, trialEnd: sub.trialEnd }
-      : null;
-
-    success(res, {
-      id: user.id,
-      phone: user.phone,
-      username: user.username,
-      role: user.role,
-      lastLogin: user.lastLogin,
-      createdAt: user.createdAt,
-      onboardingComplete: user.onboardingComplete,
-      theme: user.theme ?? 'light',
-      accentColor: user.accentColor ?? undefined,
-      pet: user.pet ?? undefined,
-      subscription,
-    });
+    success(res, await UserEntity.fromDoc(user).toPublic());
   }),
 );
 
@@ -148,25 +142,9 @@ router.patch(
     if (req.body.accentColor !== undefined) updates.accentColor = req.body.accentColor;
 
     if (Object.keys(updates).length === 0) {
-      const sub = await Subscription.findOne({ userId });
-      const subscription = sub
-        ? { status: sub.status, plan: sub.plan, currentPeriodEnd: sub.currentPeriodEnd, trialEnd: sub.trialEnd }
-        : null;
       const user = await User.findById(userId);
       if (!user) throw new AppError('User not found', 404);
-      return success(res, {
-        id: user.id,
-        phone: user.phone,
-        username: user.username,
-        role: user.role,
-        lastLogin: user.lastLogin,
-        createdAt: user.createdAt,
-        onboardingComplete: user.onboardingComplete,
-        theme: user.theme ?? 'light',
-        accentColor: user.accentColor ?? undefined,
-        pet: user.pet ?? undefined,
-        subscription,
-      });
+      return success(res, await UserEntity.fromDoc(user).toPublic());
     }
 
     const updated = await User.findByIdAndUpdate(
@@ -176,24 +154,7 @@ router.patch(
     );
     if (!updated) throw new AppError('User not found', 404);
 
-    const sub = await Subscription.findOne({ userId });
-    const subscription = sub
-      ? { status: sub.status, plan: sub.plan, currentPeriodEnd: sub.currentPeriodEnd, trialEnd: sub.trialEnd }
-      : null;
-
-    success(res, {
-      id: updated.id,
-      phone: updated.phone,
-      username: updated.username,
-      role: updated.role,
-      lastLogin: updated.lastLogin,
-      createdAt: updated.createdAt,
-      onboardingComplete: updated.onboardingComplete,
-      theme: updated.theme ?? 'light',
-      accentColor: updated.accentColor ?? undefined,
-      pet: updated.pet ?? undefined,
-      subscription,
-    });
+    success(res, await UserEntity.fromDoc(updated).toPublic());
   }),
 );
 
@@ -363,6 +324,131 @@ router.post(
     }
 
     success(res, { profile });
+  }),
+);
+
+// ─── GET /users/:userId/public-profile ─────────────────────────────────────
+
+const publicProfileSchema = {
+  params: z.object({
+    userId: z.string().min(1),
+  }),
+};
+
+/**
+ * Public companion + skills card for viewing another player (multiplayer, friends).
+ * Includes friendship relation relative to the authenticated viewer.
+ */
+router.get(
+  '/:userId/public-profile',
+  protect,
+  validate(publicProfileSchema),
+  catchAsync(async (req, res) => {
+    const meId = req.user?.id;
+    if (!meId) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
+
+    const userId = String(req.params.userId);
+
+    // Stress-test bots are synthetic presence — no User document.
+    if (isStressBot(userId)) {
+      const player = multiplayerManager.getInstanceForUser(userId)?.getPlayer(userId);
+      if (!player) throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+      const skills = toPublicSkills(createDefaultSkills());
+      return success(res, {
+        id: userId,
+        username: player.username,
+        farmLevel: 1,
+        totalLevel: 0,
+        skills,
+        friendship: { status: 'none' as const },
+        pet: {
+          name: player.petName,
+          customName: player.petName,
+          vibe: 'Bot',
+          category: 'bot',
+          imageUrl: player.petImageUrl,
+          pose: player.petPose,
+          hunger: 100,
+          happy: 100,
+          mood: 100,
+          level: 0,
+          totalLevel: 0,
+          skills,
+        },
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+
+    const doc = await User.findById(userId);
+    if (!doc || !doc.pet) {
+      throw new AppError('User not found', 404, 'USER_NOT_FOUND');
+    }
+
+    const skills = ensureUserSkills(doc);
+    syncPetTotalLevelFromSkills(doc);
+    if (doc.isModified('skills') || doc.isModified('pet')) {
+      await doc.save();
+    }
+    const publicSkills = toPublicSkills(skills);
+    const totalLevel = totalSkillLevel(skills);
+
+    const meOid = new mongoose.Types.ObjectId(meId);
+    const themOid = new mongoose.Types.ObjectId(userId);
+    const friendDoc =
+      meId === userId
+        ? null
+        : await Friend.findOne({
+            $or: [
+              { fromUserId: meOid, toUserId: themOid },
+              { fromUserId: themOid, toUserId: meOid },
+            ],
+            status: { $in: ['pending', 'accepted'] },
+          }).lean();
+
+    let friendship: {
+      status: 'self' | 'none' | 'friends' | 'pending_outgoing' | 'pending_incoming';
+      requestId?: string;
+    } = { status: meId === userId ? 'self' : 'none' };
+
+    if (friendDoc) {
+      if (friendDoc.status === 'accepted') {
+        friendship = { status: 'friends', requestId: friendDoc._id.toString() };
+      } else if (friendDoc.fromUserId.toString() === meId) {
+        friendship = { status: 'pending_outgoing', requestId: friendDoc._id.toString() };
+      } else {
+        friendship = { status: 'pending_incoming', requestId: friendDoc._id.toString() };
+      }
+    }
+
+    const farm = await Farm.findOne({ userId }).select('farmLevel').lean();
+
+    success(res, {
+      id: doc._id.toString(),
+      username: doc.username ?? undefined,
+      farmLevel: farm?.farmLevel ?? 1,
+      totalLevel,
+      skills: publicSkills,
+      friendship,
+      pet: {
+        name: doc.pet.name,
+        customName: doc.pet.customName,
+        vibe: doc.pet.vibe,
+        category: doc.pet.category,
+        baseColor: doc.pet.baseColor,
+        secondaryColor: doc.pet.secondaryColor,
+        imageUrl: doc.pet.imageUrl,
+        pose: doc.pet.pose,
+        hunger: doc.pet.hunger ?? 100,
+        happy: doc.pet.happy ?? 100,
+        mood: doc.pet.mood ?? 100,
+        level: totalLevel,
+        totalLevel,
+        skills: publicSkills,
+      },
+    });
   }),
 );
 

@@ -110,7 +110,7 @@ export function createQueryUserDataTool(userId: string) {
     function: {
       name: 'query_user_data',
       description:
-        "Look up the user's wellness and game data. Use when they ask about food, water, mood, weight, quests, achievements, or login streaks. Returns JSON.",
+        "Look up the user's wellness and game data. Use when they ask about food, water, mood, weight, fasting, quests, achievements, or login streaks. Returns JSON.",
       parameters: {
         type: 'object',
         properties: {

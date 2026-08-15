@@ -1,6 +1,6 @@
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import { GameItemDef } from '../models/GameItemDef.js';
-import { ensureCompoundTreeDefs } from '../services/TreeService.js';
+import { copyTreeVariantArt, ensureCompoundTreeDefs } from '../services/TreeService.js';
 
 const ITEMS = [
   // ── Buildings ────────────────────────────────────────────────────────
@@ -12,7 +12,8 @@ const ITEMS = [
     category: 'building',
     placeable: true,
     cols: 6,
-    rows: 5,
+    rows: 2,
+    centerOverflow: true,
     interactAction: { type: 'open_scene', payload: 'house' },
     sortOrder: 1,
   },
@@ -41,6 +42,21 @@ const ITEMS = [
     buyable: true,
     gemPrice: 75,
     sortOrder: 3,
+  },
+  {
+    itemType: 'smelter',
+    label: 'Smelter',
+    emoji: '🔥',
+    color: '#C45C26',
+    category: 'building',
+    placeable: true,
+    cols: 2,
+    rows: 2,
+    centerOverflow: true,
+    interactAction: { type: 'open_modal', payload: 'smelting' },
+    buyable: true,
+    gemPrice: 120,
+    sortOrder: 4,
   },
   {
     itemType: 'sell_box',
@@ -79,8 +95,7 @@ const ITEMS = [
     placeable: false,
     cols: 1,
     rows: 1,
-    buyable: true,
-    gemPrice: 10,
+    buyable: false,
     sortOrder: 12,
   },
   {
@@ -89,11 +104,11 @@ const ITEMS = [
     emoji: '🪨',
     color: '#9E9E9E',
     category: 'material',
+    subCategory: 'ground_pickup',
     placeable: false,
     cols: 1,
     rows: 1,
-    buyable: true,
-    gemPrice: 15,
+    buyable: false,
     sortOrder: 13,
   },
   {
@@ -119,15 +134,76 @@ const ITEMS = [
     sortOrder: 15,
   },
   {
-    itemType: 'wooden_plank',
-    label: 'Wooden Plank',
-    emoji: '📐',
-    color: '#A1887F',
-    category: 'decoration',
-    placeable: true,
+    itemType: 'iron',
+    label: 'Iron',
+    emoji: '🔩',
+    color: '#90A4AE',
+    category: 'material',
+    placeable: false,
     cols: 1,
     rows: 1,
-    sortOrder: 23,
+    buyable: false,
+    sortOrder: 16,
+  },
+  {
+    itemType: 'cloth',
+    label: 'Cloth',
+    emoji: '🧵',
+    color: '#E8D5C4',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    buyable: false,
+    sortOrder: 17,
+  },
+  {
+    itemType: 'glass',
+    label: 'Glass',
+    emoji: '🪟',
+    color: '#B3E5FC',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    buyable: false,
+    sortOrder: 18,
+  },
+  {
+    itemType: 'rope',
+    label: 'Rope',
+    emoji: '🪢',
+    color: '#C4A574',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    buyable: false,
+    sortOrder: 19,
+  },
+  {
+    itemType: 'crystal',
+    label: 'Crystal',
+    emoji: '💎',
+    color: '#CE93D8',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    buyable: false,
+    sortOrder: 20,
+  },
+  {
+    itemType: 'wooden_plank',
+    label: 'Plank',
+    emoji: '📐',
+    color: '#A1887F',
+    category: 'material',
+    placeable: false,
+    cols: 1,
+    rows: 1,
+    buyable: false,
+    sortOrder: 21,
   },
 
   // ── Soil ─────────────────────────────────────────────────────────────
@@ -136,10 +212,10 @@ const ITEMS = [
     label: 'Soil',
     emoji: '🟫',
     color: '#8B5E3C',
-    category: 'decoration',
-    placeable: false,
-    cols: 1,
-    rows: 1,
+    category: 'soil',
+    placeable: true,
+    cols: 6,
+    rows: 5,
     sortOrder: 0,
   },
 
@@ -154,10 +230,9 @@ const ITEMS = [
     cols: 1,
     rows: 1,
     growthMs: 30_000,
-    harvestYield: [
-      { itemType: 'wheat_seed', qty: 2 },
-      { itemType: 'wheat', qty: 1 },
-    ],
+    harvestYield: [{ itemType: 'wheat', qty: 1 }],
+    sellable: true,
+    sellPrice: 1,
     sortOrder: 10,
   },
 
@@ -171,6 +246,8 @@ const ITEMS = [
     placeable: false,
     cols: 1,
     rows: 1,
+    sellable: true,
+    sellPrice: 3,
     sortOrder: 11,
   },
 
@@ -343,6 +420,7 @@ const ITEMS = [
     emoji: '🪵',
     color: '#A1887F',
     category: 'material',
+    subCategory: 'ground_pickup',
     placeable: false,
     cols: 1,
     rows: 1,
@@ -629,6 +707,10 @@ async function seed() {
     );
     console.log(`  Upserted: ${item.itemType}`);
   }
+
+  // oak_plain / dark_oak reuse oak sprites until they have their own art.
+  await copyTreeVariantArt('oak', 'oak_plain');
+  await copyTreeVariantArt('oak', 'dark_oak');
 
   for (const item of ITEMS) {
     const fruit = item as { itemType: string; growsOnTrees?: string[] };

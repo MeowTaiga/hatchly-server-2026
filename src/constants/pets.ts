@@ -354,7 +354,8 @@ export function pickRandomPets(categories: PetCategory[], count = 3): GeneratedP
 export function buildPetImagePrompt(pet: GeneratedPet): string {
   return `Create a cute, digital art style illustration of a ${pet.name} with a ${pet.vibe} vibe.
 The color palette should be ${pet.baseColor} and ${pet.secondaryColor}.
-The art style should be chibi and adorable with a bold black outline around the pet. The pet should have no nose, No random Artifacts on the face other than a mouth.
+The art style should be chibi and adorable with a bold black outline around the pet. The pet should have no nose. No random artifacts on the face.
+MOUTH (critical): use a tiny simple closed smile only — a short soft black curved line or tiny "u". Do NOT draw an open mouth, gaping hole, dark red/black void inside the mouth, visible tongue, teeth, or a solid red/pink oval sticker mouth. Keep the mouth minimal like a kawaii line-art smile.
 It should appear as a baby level 1 pet, so it should look small, squishy and innocent. The pet should be happy and expressive — no sadness, anger, or neutral expressions.
 There must be no text, numbers, or logos in the image.
 IMPORTANT: The background must be 100% transparent (PNG with alpha).

@@ -211,7 +211,6 @@ router.get(
 
     const raw = await WeightLog.find({ userId })
       .sort({ date: -1 })
-      .limit(90)
       .lean();
 
     const logs = raw.map(({ _id, __v, ...rest }) => ({ id: _id.toString(), ...rest }));

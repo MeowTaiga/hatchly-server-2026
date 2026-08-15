@@ -72,6 +72,8 @@ export interface TodaySummary {
   waterOz: number;
   weightLbs: number | null;
   mood?: string;
+  /** All mood diary entries today, formatted for the pet prompt. */
+  moodDiary?: string;
   foods: TodayFoodEntry[];
 }
 
@@ -83,11 +85,11 @@ export async function getTodaySummary(userId: string, timezone?: string): Promis
   const userIdObj = new Types.ObjectId(userId);
   const today = getTodayDateStr(timezone);
 
-  const [foodLogs, waterLogs, weightLog, moodLog] = await Promise.all([
+  const [foodLogs, waterLogs, weightLog, moodLogs] = await Promise.all([
     FoodLog.find({ userId: userIdObj, date: today }).sort({ loggedAt: 1 }).lean(),
     WaterLog.find({ userId: userIdObj, date: today }).lean(),
     WeightLog.findOne({ userId: userIdObj, date: today }).lean(),
-    MoodLog.findOne({ userId: userIdObj, date: today }).lean(),
+    MoodLog.find({ userId: userIdObj, date: today }).sort({ createdAt: 1 }).lean(),
   ]);
 
   const calories = foodLogs.reduce((sum, l) => sum + (l.calories ?? 0) * (l.numberOfServings ?? 1), 0);
@@ -102,12 +104,21 @@ export async function getTodaySummary(userId: string, timezone?: string): Promis
     };
   });
 
+  const latestMood = moodLogs.length ? moodLogs[moodLogs.length - 1] : null;
+  const moodDiary =
+    moodLogs.length > 0
+      ? moodLogs
+          .map((m) => (m.note ? `${m.mood} ("${m.note.slice(0, 80)}")` : m.mood))
+          .join(', ')
+      : undefined;
+
   return {
     foodLogCount: foodLogs.length,
     calories: Math.round(calories),
     waterOz: Math.round(waterOz * 10) / 10,
     weightLbs: weightLog?.weight ?? null,
-    mood: moodLog?.mood ?? undefined,
+    mood: latestMood?.mood ?? undefined,
+    moodDiary,
     foods,
   };
 }

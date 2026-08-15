@@ -7,9 +7,7 @@ export interface IUserQuest extends Document {
   userId: mongoose.Types.ObjectId;
   questId: string;
   status: UserQuestStatus;
-  /** For multi-step quests: which step user is on. */
-  currentStepId?: string;
-  /** Tracked progress across requirement types. */
+  /** Counters tallied while the quest is active. Item/building/equip/XP requirements are read live instead. */
   progress: {
     actions: Map<string, number>;
     npcTalks?: Map<string, number>;
@@ -28,7 +26,6 @@ const userQuestSchema = new Schema<IUserQuest>(
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     questId: { type: String, required: true },
     status: { type: String, required: true, enum: ['locked', 'active', 'completed'], default: 'locked' },
-    currentStepId: { type: String },
     progress: {
       actions: { type: Map, of: Number, default: {} },
       npcTalks: { type: Map, of: Number, default: undefined },

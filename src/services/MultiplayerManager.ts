@@ -141,6 +141,19 @@ class MultiplayerManager {
     return this.userInstance.get(userId)?.roomName ?? null;
   }
 
+  /**
+   * Bind a synthetic presence (stress-test bots) so getInstanceForUser works
+   * for trade / profile lookups. Does not call addPlayer — caller already did.
+   */
+  bindPresence(userId: string, instance: SceneInstance): void {
+    this.userInstance.set(userId, instance);
+  }
+
+  /** Unbind synthetic presence without leaving real players. */
+  unbindPresence(userId: string): void {
+    this.userInstance.delete(userId);
+  }
+
   async invalidateSceneConfig(slug: string): Promise<void> {
     this.sceneConfigs.delete(slug);
     const config = await this.getSceneConfig(slug);

@@ -14,7 +14,7 @@ import { createLogger } from '../config/logger.js';
 const log = createLogger('PetHunger');
 
 /**
- * Depletes hunger from all pets. Runs every 5 minutes.
+ * Depletes hunger from all pets. Runs every 7.5 minutes (~33% slower than the old 5‑min cadence).
  * - All users (connected or offline): deplete hunger.
  * - We do NOT consume from the food dish. Food is only consumed when the user is
  *   in-game and the Pet AI walks the pet to the bowl (client emits GAME_CONSUME_FROM_FOOD_DISH).

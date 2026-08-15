@@ -61,6 +61,7 @@ const searchSchema = {
   }),
 };
 
+
 const logSchema = {
   body: z.object({
     foodId: z.string().min(1),
@@ -140,7 +141,7 @@ router.get(
   protect,
   validate(searchSchema),
   catchAsync(async (req, res) => {
-    const { q, page } = req.query as { q: string; page: number };
+    const { q, page } = req.query as unknown as { q: string; page: number };
     const raw = await fatSecretService.search(q, page);
 
     const list = raw?.foods?.food;
@@ -647,7 +648,7 @@ router.get(
   '/:id',
   protect,
   catchAsync(async (req, res) => {
-    const raw = await fatSecretService.getById(req.params.id);
+    const raw = await fatSecretService.getById(String(req.params.id));
     const f = raw?.food;
     if (!f) throw new AppError('Food not found', 404, 'FOOD_NOT_FOUND');
 

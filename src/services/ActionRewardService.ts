@@ -33,16 +33,17 @@ export type ActionRewardResult = {
 export async function grantActionRewards(
   userId: string,
   action: XpAction,
-  clientDate?: string,
+  _clientDate?: string,
 ): Promise<ActionRewardResult> {
-  const result = await petService.gainXP(userId, action, undefined, clientDate);
+  // Daily XP caps use server clock + user timezone — ignore client-supplied dates.
+  const result = await petService.gainXP(userId, action);
 
   if (result.xpGained === 0) {
     return { pet: result.pet, xpGained: 0, gemsAwarded: 0 };
   }
 
   const farm = await farmService.loadOrCreateFarm(userId);
-  const level = await farmService.resolveFarmLevel(userId, farm.xp);
+  const level = farmService.farmLevelOf(farm);
   const gems = gemsForAction(action, level.level);
 
   farm.gems += gems;

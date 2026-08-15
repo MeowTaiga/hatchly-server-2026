@@ -84,6 +84,27 @@ export function globalErrorHandler(
   else if (err instanceof mongoose.Error.CastError) error = handleCastError(err);
   else if (err.code === 11000) error = handleDuplicateKey(err);
   else if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') error = handleJwtError();
+  else if (
+    err?.type === 'entity.too.large' ||
+    err?.status === 413 ||
+    err?.statusCode === 413 ||
+    /request entity too large/i.test(String(err?.message ?? ''))
+  ) {
+    error = new AppError(
+      'Scene payload is too large to save. Remove some objects or simplify the scene, then try again.',
+      413,
+      'PAYLOAD_TOO_LARGE',
+    );
+  } else if (
+    err?.name === 'MongoServerError' &&
+    (/larger than|document.*too large|BSONObj size/i.test(String(err?.message ?? '')) || err?.code === 10334)
+  ) {
+    error = new AppError(
+      'Scene document exceeds MongoDB’s 16MB limit. Split the scene or remove placements.',
+      413,
+      'DOCUMENT_TOO_LARGE',
+    );
+  }
 
   const statusCode: number = error.statusCode || 500;
   const status: string = error.status || 'error';

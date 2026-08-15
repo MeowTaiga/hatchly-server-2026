@@ -31,6 +31,8 @@ export const WS_EVENTS = {
   GAME_HARVEST: 'game:harvest',
   /** Client → server: shake a tree to harvest fruit or other drops. */
   GAME_SHAKE_TREE: 'game:shake_tree',
+  /** Client → server: chop a farm tree with an axe (3 wood / tree / day). */
+  GAME_CHOP_TREE: 'game:chop_tree',
   GAME_RENAME_FARM: 'game:rename_farm',
   GAME_MOVE_ITEM: 'game:move_item',
   GAME_WATER_TILE: 'game:water_tile',
@@ -69,6 +71,14 @@ export const WS_EVENTS = {
   BALLOON_POP: 'balloon:pop',
   /** Server → client: pop result with item, label, qty. */
   BALLOON_POPPED: 'balloon:popped',
+  /** Client → server: start a Spirit Snatch round (hourly, server-authored). */
+  GAME_SPIRIT_SNATCH_START: 'game:spirit_snatch_start',
+  /** Server → client: round payload or cooldown. */
+  GAME_SPIRIT_SNATCH_START_RESULT: 'game:spirit_snatch_start_result',
+  /** Client → server: finish a Spirit Snatch round with catch-zone taps. */
+  GAME_SPIRIT_SNATCH: 'game:spirit_snatch',
+  /** Server → client: Spirit Snatch result (score + candy awarded). */
+  GAME_SPIRIT_SNATCH_RESULT: 'game:spirit_snatch_result',
   /** Server → client: a balloon has despawned (timed out). */
   BALLOON_DESPAWN: 'balloon:despawn',
 
@@ -78,26 +88,39 @@ export const WS_EVENTS = {
   /** Server → client: dig result with item, label, qty. */
   FOSSIL_DUG: 'fossil:dug',
 
+  // ─── Ground pickup Events ────────────────────────────────────────────
+  /** Client → server: pick up a daily ground item (stone/stick). */
+  GROUND_PICKUP: 'ground:pickup',
+  /** Server → client: pickup result with item, label, qty. */
+  GROUND_PICKED_UP: 'ground:picked_up',
+
+  // ─── Mining Events ───────────────────────────────────────────────────
+  /** Client → server: start mining a scene ore tile (opens minigame). */
+  MINE_ORE_BEGIN: 'mine:ore_begin',
+  /** Server → client: vein info + tap/time for the mash minigame. */
+  MINE_ORE_READY: 'mine:ore_ready',
+  /** Client → server: finish the mash minigame. */
+  MINE_ORE_COMPLETE: 'mine:ore_complete',
+  /** Client → server: closed the minigame without finishing. */
+  MINE_ORE_CANCEL: 'mine:ore_cancel',
+  /** Server → client: mining result with item, label, qty. */
+  MINE_ORE_RESULT: 'mine:ore_result',
+
   // ─── Scenery Events ──────────────────────────────────────────────────
   /** Server → all clients: admin re-baked scenery for a farm size. */
   SCENERY_UPDATED: 'scenery:updated',
 
   // ─── Quest Events ─────────────────────────────────────────────────
-  /** Client → server: complete a quest. */
+  // All quest results come back on GAME_STATE_UPDATE, which carries the quest
+  // list, the upgrade flag, any completions to celebrate and any dialogs to
+  // show. These are the client's four ways of reporting a quest-relevant act.
+  /** Client → server: turn in a quest the player completed deliberately. */
   QUEST_COMPLETE: 'quest:complete',
-  /** Server → client: quest completed, full snapshot follows. */
-  QUEST_COMPLETED: 'quest:completed',
-  /** Server → client: show a quest dialog sequence. */
-  QUEST_DIALOG: 'quest:dialog',
-  /** Client → server: try to activate quests by talking to NPC. */
-  QUEST_ACTIVATE_BY_NPC: 'quest:activate_by_npc',
-  /** Client → server: try to activate quests by entering a scene. */
-  QUEST_ACTIVATE_BY_SCENE: 'quest:activate_by_scene',
-  /** Server → client: quests activated by trigger (includes start dialogs). */
-  QUEST_ACTIVATED: 'quest:activated',
-  /** Client → server: user finished NPC dialog (for talk_to_npc requirement). */
-  QUEST_NPC_DIALOG_DISMISSED: 'quest:npc_dialog_dismissed',
-  /** Client → server: user opened a modal (for open_modal requirement). */
+  /** Client → server: the player finished talking to an NPC. */
+  QUEST_TALK_TO_NPC: 'quest:talk_to_npc',
+  /** Client → server: the player entered a scene. */
+  QUEST_ENTER_SCENE: 'quest:enter_scene',
+  /** Client → server: the player opened a modal or screen. */
   QUEST_MODAL_OPENED: 'quest:modal_opened',
 
   // ─── Cooking Events ──────────────────────────────────────────────────
@@ -117,10 +140,23 @@ export const WS_EVENTS = {
   GAME_COLLECT_WATER_RESULT: 'game:collect_water_result',
 
   // ─── Crafting Events ─────────────────────────────────────────────────
-  /** Client → server: attempt to craft with selected materials. */
+  /** Client → server: craft a known recipe by recipeId (must be learned). */
   GAME_CRAFT: 'game:craft',
   /** Server → client: result of a crafting attempt. */
   GAME_CRAFT_RESULT: 'game:craft_result',
+  /** Client → server: smelt a recipe at the smelter. */
+  GAME_SMELT: 'game:smelt',
+  /** Server → client: result of a smelting attempt. */
+  GAME_SMELT_RESULT: 'game:smelt_result',
+  /** Client → server: consume a recipe scroll to learn it permanently. */
+  GAME_LEARN_RECIPE: 'game:learn_recipe',
+  /** Server → client: recipe learned (or error via GAME_ERROR). */
+  GAME_LEARN_RECIPE_RESULT: 'game:learn_recipe_result',
+
+  /** Client → server: move items from backpack into farm storage. */
+  GAME_STORAGE_DEPOSIT: 'game:storage_deposit',
+  /** Client → server: move items from storage into backpack. */
+  GAME_STORAGE_WITHDRAW: 'game:storage_withdraw',
 
   // ─── Multiplayer Events ────────────────────────────────────────────
   /** Client → server: join a multiplayer scene. */
@@ -161,12 +197,43 @@ export const WS_EVENTS = {
   MP_FISH_CANCEL: 'mp:fish_cancel',
   /** Server → room: player caught a fish (result bubble). */
   MP_FISH_CAUGHT: 'mp:fish_caught',
+  /** Server → room: player mined ore (result bubble). */
+  MP_ORE_MINED: 'mp:ore_mined',
+
   /** Server → room: player failed the mini-game. */
   MP_FISH_FAILED: 'mp:fish_failed',
   /** Server → room: player started fishing at (col, row). */
   MP_FISH_STARTED: 'mp:fish_started',
   /** Server → room: player canceled fishing (recast or leave). */
   MP_FISH_CANCELED: 'mp:fish_canceled',
+
+  // ─── Trade Events ───────────────────────────────────────────────────────
+  /** Client → server: request a trade with another player in the same instance. */
+  MP_TRADE_REQUEST: 'mp:trade_request',
+  /** Server → recipient: incoming trade request. */
+  MP_TRADE_REQUESTED: 'mp:trade_requested',
+  /** Client → server: accept a pending trade request. */
+  MP_TRADE_ACCEPT: 'mp:trade_accept',
+  /** Client → server: decline a pending trade request. */
+  MP_TRADE_DECLINE: 'mp:trade_decline',
+  /** Server → initiator: recipient declined. */
+  MP_TRADE_DECLINED: 'mp:trade_declined',
+  /** Server → both: trade window is open. */
+  MP_TRADE_OPEN: 'mp:trade_open',
+  /** Client → server: replace your offer (items are escrowed from inventory). */
+  MP_TRADE_UPDATE: 'mp:trade_update',
+  /** Server → both: authoritative trade snapshot. */
+  MP_TRADE_STATE: 'mp:trade_state',
+  /** Client → server: mark yourself ready (both ready → complete). */
+  MP_TRADE_CONFIRM: 'mp:trade_confirm',
+  /** Client → server: cancel an open / pending trade. */
+  MP_TRADE_CANCEL: 'mp:trade_cancel',
+  /** Server → other party: trade cancelled. */
+  MP_TRADE_CANCELLED: 'mp:trade_cancelled',
+  /** Server → both: trade completed successfully. */
+  MP_TRADE_COMPLETE: 'mp:trade_complete',
+  /** Server → actor: trade error. */
+  MP_TRADE_ERROR: 'mp:trade_error',
 } as const;
 
 /** Union type of all valid event names */

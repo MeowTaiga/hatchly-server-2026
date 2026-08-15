@@ -83,7 +83,7 @@ router.post(
     if (!userId) throw new AppError('Not authenticated', 401, 'AUTH_REQUIRED');
 
     try {
-      const result = await mailService.claimMail(userId, req.params.id);
+      const result = await mailService.claimMail(userId, String(req.params.id));
       success(res, result);
     } catch (err) {
       throw new AppError(err instanceof Error ? err.message : 'Failed to claim mail', 400, 'MAIL_CLAIM_FAILED');

@@ -28,18 +28,40 @@ export interface IUserPet {
   happy: number;
   /** 0–100. Sours (decreases) when over-petted. */
   mood: number;
-  /** Current level — starts at 1 */
+  /**
+   * Average skill level (floor of mean of all skill levels). Synced by SkillXpService.
+   * Replaces the old care-only pet level.
+   */
   level: number;
-  /** Current XP within the level */
+  /** @deprecated Unused — kept for older clients. Always 0. */
   xp: number;
-  /** XP required to reach the next level */
+  /** @deprecated Unused — kept for older clients. Always 1. */
   xpToNextLevel: number;
 }
+
+/** Per-skill progress (power-curve levels, OSRS-style). */
+export interface ISkillProgress {
+  level: number;
+  /** XP toward the next level */
+  xp: number;
+}
+
+export type IUserSkills = {
+  farming: ISkillProgress;
+  fishing: ISkillProgress;
+  cooking: ISkillProgress;
+  crafting: ISkillProgress;
+  mining: ISkillProgress;
+  social: ISkillProgress;
+  health: ISkillProgress;
+};
 
 // ─── Interface ─────────────────────────────────────────────────────────────────
 
 export interface IUser extends Document {
   _id: mongoose.Types.ObjectId;
+  /** Mongoose's `id` virtual. Declared because routes read it off `req.user`. */
+  id: string;
   /** E.164 phone number — the user's primary identity and login credential */
   phone: string;
   /** Optional display name, typically set during onboarding */
@@ -52,6 +74,8 @@ export interface IUser extends Document {
   status: 'active' | 'suspended';
   /** The user's chosen pet, populated after onboarding pet selection */
   pet?: IUserPet;
+  /** Per-activity skill levels (farming, fishing, …). */
+  skills?: IUserSkills;
   /** Whether the user has completed the onboarding flow */
   onboardingComplete: boolean;
   /** UI theme preference (light / dark) — account setting */
@@ -81,9 +105,30 @@ const petSchema = new Schema<IUserPet>(
     hunger: { type: Number, default: 100, min: 0, max: 100 },
     happy: { type: Number, default: 100, min: 0, max: 100 },
     mood: { type: Number, default: 100, min: 0, max: 100 },
-    level: { type: Number, default: 1 },
+    level: { type: Number, default: 0 },
     xp: { type: Number, default: 0 },
-    xpToNextLevel: { type: Number, default: 100 },
+    xpToNextLevel: { type: Number, default: 1 },
+  },
+  { _id: false },
+);
+
+const skillProgressSchema = new Schema<ISkillProgress>(
+  {
+    level: { type: Number, default: 0, min: 0, max: 99 },
+    xp: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false },
+);
+
+const skillsSchema = new Schema(
+  {
+    farming: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    fishing: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    cooking: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    crafting: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    mining: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    social: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
+    health: { type: skillProgressSchema, default: () => ({ level: 0, xp: 0 }) },
   },
   { _id: false },
 );
@@ -117,6 +162,10 @@ const userSchema = new Schema<IUser>({
   },
   pet: {
     type: petSchema,
+    default: undefined,
+  },
+  skills: {
+    type: skillsSchema,
     default: undefined,
   },
   onboardingComplete: {
